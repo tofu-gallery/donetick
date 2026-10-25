@@ -75,7 +75,11 @@ func (s *S3Storage) Save(ctx context.Context, path string, file io.Reader) error
 func (s *S3Storage) Delete(ctx context.Context, paths []string) error {
 	var err error
 	for _, path := range paths {
-		key := s.BasePath + path
+		// Tofu (2026-10-25): the same key Save, GetURL and the signer build, with "/"
+		// between the base path and the file's path. Upstream joined them without it,
+		// so a delete named an object that does not exist, and every removed
+		// attachment, image or draft stayed in the bucket.
+		key := fmt.Sprintf("%s/%s", s.BasePath, path)
 		_, e := s.Client.DeleteObjectWithContext(ctx, &s3.DeleteObjectInput{
 			Bucket: aws.String(s.Bucket),
 			Key:    aws.String(key),
