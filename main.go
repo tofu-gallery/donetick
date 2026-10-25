@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -284,6 +285,14 @@ func newServer(lc fx.Lifecycle, cfg *config.Config, db *gorm.DB, notifier *notif
 	for _, origin := range cfg.Server.CorsAllowOrigins {
 		allowOrigins[origin] = true
 	}
+	// Tofu (2026-10-25): the server's own public address (server.public_host,
+	// DT_SERVER_PUBLIC_HOST) is always an allowed origin. A browser on that address
+	// is this app's own web app, which the CORS check otherwise lets through only
+	// when its Origin matches the Host header this server receives, and a proxy in
+	// front of the server may rewrite that header.
+	if origin := publicOrigin(cfg.Server.PublicHost); origin != "" {
+		allowOrigins[origin] = true
+	}
 	corsConfig.AllowOriginFunc = func(origin string) bool {
 		return allowOrigins[origin]
 	}
@@ -378,4 +387,22 @@ func newServer(lc fx.Lifecycle, cfg *config.Config, db *gorm.DB, notifier *notif
 	})
 
 	return r
+}
+
+// Tofu (2026-10-25): the origin (scheme://host[:port]) of a public address such as
+// server.public_host, or "" when it names none. An address without a scheme is taken
+// as https, as the calendar feed's links take it.
+func publicOrigin(address string) string {
+	address = strings.TrimSpace(address)
+	if address == "" {
+		return ""
+	}
+	if !strings.HasPrefix(address, "http://") && !strings.HasPrefix(address, "https://") {
+		address = "https://" + address
+	}
+	u, err := url.Parse(address)
+	if err != nil || u.Host == "" {
+		return ""
+	}
+	return strings.ToLower(u.Scheme + "://" + u.Host)
 }
