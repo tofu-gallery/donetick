@@ -72,6 +72,13 @@ oauth2:
 # When true, all password-based auth (signup, login, reset) is rejected and
 # the login UI hides the password form.
 # disable_password_auth: false
+# Tofu (2026-10-25): limits for uploaded files (attachments, images in descriptions,
+# completion notes), in bytes. Without them both are 0 and every upload is refused as
+# too large or over quota. The bucket the files go to is set with the DT_STORAGE_*
+# settings (TOFU.md lists them); until it is, an upload answers that it is not set up.
+storage:
+  max_file_size: 4194304 # 4 MiB for one file
+  max_user_storage: 1073741824 # 1 GiB for each circle (household), its members together
 # Real-time configuration
 realtime:
   enabled: true
