@@ -19,6 +19,13 @@ type TelegramNotifier struct {
 }
 
 func NewTelegramNotifier(config *config.Config) *TelegramNotifier {
+	// Tofu (2026-10-25): without a token there is no bot to reach. NewBotAPI would
+	// still ask api.telegram.org about the empty token at every start, and fail, so
+	// the server ran without Telegram notifications (nil) either way; now it sends
+	// nothing.
+	if config.Telegram.Token == "" {
+		return nil
+	}
 	bot, err := tgbotapi.NewBotAPI(config.Telegram.Token)
 	if err != nil {
 		fmt.Println("Error creating bot: ", err)
