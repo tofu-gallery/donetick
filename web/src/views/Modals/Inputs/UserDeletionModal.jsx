@@ -1,0 +1,346 @@
+import {
+  Box,
+  Card,
+  CircularProgress,
+  FormControl,
+  FormLabel,
+  Input,
+  Option,
+  Select,
+  Typography,
+} from '@mui/joy'
+import { useCallback, useEffect, useState } from 'react'
+import { useTranslation } from 'react-i18next'
+import { useNavigate } from 'react-router-dom'
+
+import ModalActions from '../../../components/common/ModalActions'
+import { useResponsiveModal } from '../../../hooks/useResponsiveModal'
+import { CheckUserDeletion, DeleteUser } from '../../../utils/Fetcher'
+
+// Sent verbatim to the delete endpoint, so it stays English in every locale —
+// the label around it is what gets translated.
+const CONFIRMATION_WORD = 'DELETE'
+
+function UserDeletionModal({ isOpen, onClose }) {
+  const { t } = useTranslation('settings')
+  const { ResponsiveModal } = useResponsiveModal()
+  const Navigate = useNavigate()
+  const [step, setStep] = useState(1) // 1: Warning, 2: Transfer, 3: Confirm
+  const [password, setPassword] = useState('')
+  const [confirmation, setConfirmation] = useState('')
+  const [transferOptions, setTransferOptions] = useState([])
+  const [circlesRequiringTransfer, setCirclesRequiringTransfer] = useState([])
+  const [availableMembers, setAvailableMembers] = useState([])
+  const [loading, setLoading] = useState(false)
+  const [error, setError] = useState('')
+
+  const resetModal = useCallback(() => {
+    setStep(1)
+    setPassword('')
+    setConfirmation('')
+    setTransferOptions([])
+    setCirclesRequiringTransfer([])
+    setAvailableMembers([])
+    setError('')
+  }, [])
+
+  const handleClose = useCallback(
+    success => {
+      resetModal()
+      onClose(success)
+    },
+    [onClose, resetModal],
+  )
+
+  const checkDeletionRequirements = async () => {
+    if (password.trim() === '') {
+      setError(t('deletion.passwordRequired'))
+      return
+    }
+
+    setLoading(true)
+    setError('')
+    try {
+      const response = await CheckUserDeletion(password)
+      const data = await response.json()
+
+      if (response.ok) {
+        if (data.requiresTransfer && data.circles) {
+          setCirclesRequiringTransfer(data.circles)
+          setAvailableMembers(data.availableMembers || [])
+          setStep(2)
+        } else {
+          setStep(3)
+        }
+      } else {
+        setError(data.error || 'Failed to check deletion requirements')
+      }
+    } catch (err) {
+      console.error('Failed to check deletion requirements:', err)
+      setError('Failed to check deletion requirements')
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  const handleTransferSelection = (circleId, newOwnerId, newOwnerName) => {
+    setTransferOptions(prev => {
+      const existing = prev.find(t => t.circleId === circleId)
+      if (existing) {
+        return prev.map(t =>
+          t.circleId === circleId ? { ...t, newOwnerId, newOwnerName } : t,
+        )
+      } else {
+        return [...prev, { circleId, newOwnerId, newOwnerName }]
+      }
+    })
+  }
+
+  const proceedToConfirmation = () => {
+    if (circlesRequiringTransfer.length === transferOptions.length) {
+      setStep(3)
+    }
+  }
+
+  const executeUserDeletion = async () => {
+    if (password.trim() === '' || confirmation !== CONFIRMATION_WORD) {
+      setError(t('deletion.passwordAndDelete'))
+      return
+    }
+
+    setLoading(true)
+    setError('')
+    try {
+      const response = await DeleteUser(password, confirmation, transferOptions)
+      const data = await response.json()
+      console.log(response)
+
+      if (response.status === 200) {
+        // Clear authentication tokens
+        localStorage.removeItem('ca_token')
+        localStorage.removeItem('ca_expiration')
+        Navigate('/login', { replace: true })
+        handleClose(true)
+        // Redirect to login or home page after successful deletion
+      } else {
+        setError(data.message || 'Failed to delete account')
+      }
+    } catch (err) {
+      console.error('Failed to delete account:', err)
+      setError(t('deletion.failed'))
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  // Keyboard shortcuts
+  useEffect(() => {
+    const handleKeyDown = event => {
+      if (!isOpen) return
+
+      if (event.key === 'Escape') {
+        event.preventDefault()
+        handleClose(false)
+        return
+      }
+    }
+
+    if (isOpen) {
+      document.addEventListener('keydown', handleKeyDown)
+    }
+
+    return () => {
+      document.removeEventListener('keydown', handleKeyDown)
+    }
+  }, [isOpen, handleClose])
+
+  const renderWarningStep = () => (
+    <>
+      <Typography level='body-md' mb={2}>
+        <strong>{t('deletion.warningLead')}</strong>{' '}
+        {t('deletion.warningIntro')}
+      </Typography>
+
+      <Box mb={3}>
+        {[
+          'removesProfile',
+          'removesChores',
+          'removesTokens',
+          'removesStorage',
+          'removesPoints',
+          'removesCircles',
+        ].map(key => (
+          <Typography key={key} level='body-sm' mb={1}>
+            • {t(`deletion.${key}`)}
+          </Typography>
+        ))}
+      </Box>
+
+      <FormControl sx={{ mb: 2 }}>
+        <FormLabel>{t('deletion.passwordToContinue')}</FormLabel>
+        <Input
+          type='password'
+          value={password}
+          onChange={e => setPassword(e.target.value)}
+          placeholder={t('deletion.passwordPlaceholder')}
+        />
+      </FormControl>
+
+      {error && (
+        <Typography level='body-sm' color='danger' mb={2}>
+          {error}
+        </Typography>
+      )}
+    </>
+  )
+
+  const renderTransferStep = () => (
+    <>
+      <Typography level='body-md' mb={3}>
+        {t('deletion.transferIntro')}
+      </Typography>
+
+      {circlesRequiringTransfer.map(circle => (
+        <Card key={circle.id} sx={{ mb: 2, p: 2 }}>
+          <Typography level='title-sm' mb={1}>
+            {t('deletion.circleLabel', { name: circle.name })}
+          </Typography>
+          <FormControl>
+            <FormLabel>{t('deletion.newOwner')}</FormLabel>
+            <Select
+              placeholder={t('deletion.selectOwner')}
+              value={
+                transferOptions.find(t => t.circleId === circle.id)
+                  ?.newOwnerId || ''
+              }
+              onChange={(_, value) => {
+                const member = availableMembers.find(m => m.id === value)
+                if (member) {
+                  handleTransferSelection(circle.id, value, member.displayName)
+                }
+              }}
+            >
+              {availableMembers
+                .filter(member => circle.members.includes(member.id))
+                .map(member => (
+                  <Option key={member.id} value={member.id}>
+                    {member.displayName}
+                  </Option>
+                ))}
+            </Select>
+          </FormControl>
+        </Card>
+      ))}
+    </>
+  )
+
+  const renderConfirmationStep = () => (
+    <>
+      <Typography level='body-md' mb={3}>
+        {t('deletion.confirmPrompt')}
+      </Typography>
+      <Typography level='body-sm' mb={2}>
+        {t('deletion.logoutNotice')}
+      </Typography>
+
+      <FormControl sx={{ mb: 2 }}>
+        <FormLabel>{t('deletion.passwordLabel')}</FormLabel>
+        <Input
+          type='password'
+          value={password}
+          onChange={e => setPassword(e.target.value)}
+          placeholder={t('deletion.passwordPlaceholder')}
+        />
+      </FormControl>
+
+      <FormControl sx={{ mb: 3 }}>
+        <FormLabel>
+          {t('deletion.typeToConfirm', { word: CONFIRMATION_WORD })}
+        </FormLabel>
+        <Input
+          value={confirmation}
+          onChange={e => setConfirmation(e.target.value)}
+          placeholder={t('deletion.typeDelete')}
+        />
+      </FormControl>
+
+      {error && (
+        <Typography level='body-sm' color='danger' mb={2}>
+          {error}
+        </Typography>
+      )}
+    </>
+  )
+
+  const renderStep = () => {
+    switch (step) {
+      case 1:
+        return renderWarningStep()
+      case 2:
+        return renderTransferStep()
+      case 3:
+        return renderConfirmationStep()
+      default:
+        return renderWarningStep()
+    }
+  }
+
+  return (
+    <ResponsiveModal
+      open={isOpen}
+      onClose={() => handleClose(false)}
+      size='lg'
+      title={
+        step === 1
+          ? 'Delete Account'
+          : step === 2
+            ? 'Transfer Circle Ownership'
+            : 'Final Confirmation'
+      }
+      role={step === 3 ? 'alertdialog' : 'dialog'}
+      closeOnBackdrop={false}
+      footer={
+        !loading && (
+          <ModalActions
+            stackOnMobile
+            secondary={{
+              label: t('accountSettings.cancel'),
+              onClick: () => handleClose(false),
+            }}
+            primary={{
+              label: step === 3 ? 'Delete Account' : 'Continue',
+              color: step === 3 ? 'danger' : 'primary',
+              onClick:
+                step === 1
+                  ? checkDeletionRequirements
+                  : step === 2
+                    ? proceedToConfirmation
+                    : executeUserDeletion,
+              disabled:
+                step === 1
+                  ? !password
+                  : step === 2
+                    ? circlesRequiringTransfer.length !== transferOptions.length
+                    : !password || confirmation !== CONFIRMATION_WORD,
+            }}
+          />
+        )
+      }
+    >
+      {loading && step === 1 ? (
+        <Box
+          display='flex'
+          justifyContent='center'
+          alignItems='center'
+          minHeight={200}
+        >
+          <CircularProgress />
+        </Box>
+      ) : (
+        renderStep()
+      )}
+    </ResponsiveModal>
+  )
+}
+
+export default UserDeletionModal

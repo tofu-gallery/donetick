@@ -1,0 +1,1579 @@
+import { Capacitor } from '@capacitor/core'
+import {
+  Archive,
+  AttachFile,
+  CalendarMonth,
+  Check,
+  Checklist,
+  Edit,
+  History,
+  HourglassEmpty,
+  MoreVert,
+  OpenInFull,
+  PeopleAlt,
+  Person,
+  PlayArrow,
+  SwitchAccessShortcut,
+  ThumbDown,
+  ThumbUp,
+  Unarchive,
+} from '@mui/icons-material'
+import {
+  Box,
+  Button,
+  Card,
+  CardContent,
+  Checkbox,
+  Chip,
+  Container,
+  FormControl,
+  Grid,
+  IconButton,
+  Input,
+  Sheet,
+  Typography,
+} from '@mui/joy'
+import { useQueryClient } from '@tanstack/react-query'
+import moment from 'moment'
+import { useEffect, useState } from 'react'
+import { useTranslation } from 'react-i18next'
+import { useNavigate, useParams, useSearchParams } from 'react-router-dom'
+
+import EmptyState from '../../components/common/EmptyState'
+import { useImpersonateUser } from '../../contexts/ImpersonateUserContext.jsx'
+import { useLocalization } from '../../contexts/LocalizationContext'
+import { useDescriptionHtml } from '../../hooks/useDescriptionHtml'
+import { usePendingCommands } from '../../hooks/usePendingCommands'
+import {
+  useChoreDetails,
+  useChoreHistory,
+} from '../../queries/ChoreQueries.jsx'
+import {
+  useChoreTimer,
+  useDeleteTimeSession,
+  usePauseChore,
+  useResetChoreTimer,
+  useStartChore,
+} from '../../queries/TimeQueries'
+import { useCircleMembers, useUserProfile } from '../../queries/UserQueries.jsx'
+import { useNotification } from '../../service/NotificationProvider'
+import {
+  ChoreHistoryStatus,
+  ChoreStatus,
+  notInCompletionWindow,
+} from '../../utils/Chores.jsx'
+import { getTextColorFromBackgroundColor } from '../../utils/Colors.jsx'
+import { commandQueue, CommandType } from '../../utils/CommandQueue'
+import {
+  ApproveChore,
+  ArchiveChore,
+  DeleteChore,
+  GetChoreDetailById,
+  MarkChoreComplete,
+  NudgeChore,
+  RejectChore,
+  SaveChore,
+  SkipChore,
+  UnArchiveChore,
+  UndoChoreAction,
+  UpdateChoreAssignee,
+  UpdateChorePriority,
+  UpdateDueDate,
+} from '../../utils/Fetcher'
+import { offlineDB } from '../../utils/OfflineDB'
+import { getSafeBottomPadding } from '../../utils/SafeAreaUtils.js'
+import ChoreActionMenu from '../components/ChoreActionMenu'
+import DueDatePickerModal, {
+  combineDueDate,
+  splitDueDate,
+} from '../components/DueDatePickerModal'
+import LoadingComponent from '../components/Loading.jsx'
+import PendingBadge from '../components/PendingBadge'
+import RichTextEditor from '../components/RichTextEditor.jsx'
+import SubTasks from '../components/SubTask.jsx'
+import AssigneeModal from '../Modals/Inputs/AssigneeModal'
+import AttachmentBrowserModal from '../Modals/Inputs/AttachmentBrowserModal'
+import ConfirmationModal from '../Modals/Inputs/ConfirmationModal'
+import NoteViewerModal from '../Modals/Inputs/NoteViewerModal'
+import NudgeModal from '../Modals/Inputs/NudgeModal'
+import WriteNFCModal from '../Modals/Inputs/WriteNFCModal'
+import TimePassedCard from './TimePassedCard.jsx'
+import TimerSplitButton from './TimerSplitButton.jsx'
+
+const isNetworkError = err =>
+  err instanceof TypeError && err.message === 'Failed to fetch'
+
+const decodeHtmlEntities = value => {
+  if (typeof value !== 'string') return ''
+
+  return value
+    .replaceAll('&lt;', '<')
+    .replaceAll('&gt;', '>')
+    .replaceAll('&quot;', '"')
+    .replaceAll('&#39;', "'")
+    .replaceAll('&amp;', '&')
+}
+
+const hasHtmlTags = value => /<\/?[a-z][\s\S]*>/i.test(value)
+
+const getNFCUrl = choreId =>
+  Capacitor.getPlatform() === 'android' || Capacitor.getPlatform() === 'ios'
+    ? `donetick://chores/${choreId}`
+    : `${window.location.origin}/chores/${choreId}`
+
+const ChoreView = () => {
+  const { t } = useTranslation('chores')
+  const { fmt } = useLocalization()
+  const [chore, setChore] = useState({})
+  const navigate = useNavigate()
+  const [performers, setPerformers] = useState([])
+  const [infoCards, setInfoCards] = useState([])
+  const { choreId } = useParams()
+  const [note, setNote] = useState(null)
+  const queryClient = useQueryClient()
+  const { showError, showSuccess, showUndo } = useNotification()
+
+  const [searchParams] = useSearchParams()
+
+  const [completedDate, setCompletedDate] = useState(null)
+  const [confirmModelConfig, setConfirmModelConfig] = useState({
+    isOpen: false,
+  })
+  const [activeModal, setActiveModal] = useState(null)
+  const [noteViewerConfig, setNoteViewerConfig] = useState({ isOpen: false })
+  const [timerActionConfig, setTimerActionConfig] = useState({ isOpen: false })
+  const [attachmentBrowserOpen, setAttachmentBrowserOpen] = useState(false)
+  const { data: circleMembersData, isLoading: isCircleMembersLoading } =
+    useCircleMembers()
+  const { data: userProfile } = useUserProfile()
+  const { impersonatedUser } = useImpersonateUser()
+  const descriptionHtml = useDescriptionHtml(chore?.description || '', {
+    choreId: chore?.id,
+  })
+  const notesHtml = useDescriptionHtml(chore?.notes || '', {
+    choreId: chore?.id,
+  })
+
+  const {
+    data: choreData,
+    isError: isChoreError,
+    isLoading: isChoreLoading,
+  } = useChoreDetails(choreId)
+  const { data: choreHistoryData } = useChoreHistory(choreId)
+
+  const { data: pendingCmds } = usePendingCommands(choreId)
+
+  const choreHistory = choreHistoryData?.res || []
+  const historyCompletionCount = choreHistory.filter(historyEntry => {
+    const status = Number(historyEntry?.status)
+    return status === ChoreHistoryStatus.COMPLETED
+  }).length
+  const completionCount = choreHistoryData
+    ? historyCompletionCount
+    : chore.totalCompletedCount || 0
+
+  const startChore = useStartChore()
+  const pauseChore = usePauseChore()
+  const deleteTimeSession = useDeleteTimeSession()
+  const resetChoreTimer = useResetChoreTimer()
+  const { data: choreTimer } = useChoreTimer(choreId)
+
+  useEffect(() => {
+    if (!choreData || !choreData.res || !circleMembersData) {
+      return
+    }
+    setChore(choreData.res)
+    document.title = 'Donetick: ' + choreData.res.name
+
+    setPerformers(circleMembersData.res)
+    if (searchParams.get('auto_complete') === 'true') {
+      navigate({ search: '' }, { replace: true })
+      handleTaskCompletion()
+    }
+  }, [choreData, circleMembersData])
+
+  useEffect(() => {
+    if (chore && performers?.length > 0) {
+      const cards = [
+        {
+          size: 6,
+          icon: <PeopleAlt />,
+          title: t('choreView.assignment'),
+          text: `${t('choreView.assigned')}: ${
+            performers.find(p => p.userId === chore.assignedTo)?.displayName ||
+            t('choreView.na')
+          }`,
+          subtext: ` ${t('choreView.last')}: ${
+            chore.lastCompletedDate
+              ? performers.find(p => p.userId === chore.lastCompletedBy)
+                  ?.displayName
+              : t('choreView.na')
+          }`,
+        },
+        {
+          size: 6,
+          icon: <CalendarMonth />,
+          title: t('choreView.schedule'),
+          text: `${t('choreView.due')}: ${
+            chore.nextDueDate
+              ? moment(chore.nextDueDate).fromNow()
+              : t('choreView.na')
+          }`,
+          subtext: `${t('choreView.last')}: ${
+            chore.lastCompletedDate
+              ? moment(chore.lastCompletedDate).fromNow()
+              : t('choreView.na')
+          }`,
+
+          subtext2:
+            chore.deadlineOffset > 0 && chore.nextDueDate
+              ? t('choreView.deadline', {
+                  date: moment(chore.nextDueDate)
+                    .add(chore.deadlineOffset, 'seconds')
+                    .fromNow(),
+                })
+              : null,
+        },
+        {
+          size: 6,
+          icon: <Checklist />,
+          title: t('choreView.statistics'),
+          text: `${t('choreView.completed')}: ${completionCount} ${t('choreView.times')}`,
+        },
+        {
+          size: 6,
+          icon: <Person />,
+          title: t('choreView.details'),
+          subtext: `${t('choreView.createdBy')}: ${
+            performers.find(p => p.userId === chore.createdBy)?.displayName ||
+            t('choreView.na')
+          }`,
+        },
+      ]
+      setInfoCards(cards)
+    }
+  }, [chore, performers, completionCount, t])
+  const handleUpdatePriority = priority => {
+    UpdateChorePriority(choreId, priority.value).then(response => {
+      if (response.ok) {
+        response.json().then(() => {
+          setChore(prev => ({ ...prev, priority: priority.value }))
+          queryClient.invalidateQueries({ queryKey: ['chores'] })
+        })
+      }
+    })
+  }
+  const handleTaskCompletion = async () => {
+    try {
+      const resp = await MarkChoreComplete(
+        choreId,
+        impersonatedUser
+          ? { completedBy: impersonatedUser.userId, note }
+          : { note },
+        completedDate,
+        null,
+      )
+      if (resp.ok) {
+        const data = await resp.json()
+        setNote(null)
+        setChore(data.res)
+        queryClient.invalidateQueries({ queryKey: ['chores'] })
+        const detailResp = await GetChoreDetailById(choreId)
+        if (detailResp.ok) {
+          const detailData = await detailResp.json()
+          setChore(detailData.res)
+        }
+        showSuccess({
+          title: t('choreView.taskCompleted'),
+          message: t('choreView.taskCompletedMessage'),
+          undoAction: async () => {
+            try {
+              const undoResponse = await UndoChoreAction(choreId)
+              if (undoResponse.ok) {
+                const detailResponse = await GetChoreDetailById(choreId)
+                if (detailResponse.ok) {
+                  const detailData = await detailResponse.json()
+                  setChore(detailData.res)
+                  queryClient.invalidateQueries({ queryKey: ['chores'] })
+                }
+                showUndo({
+                  title: t('choreView.undoSuccessful'),
+                  message: t('choreView.taskCompletionUndone'),
+                })
+              } else {
+                throw new Error(t('choreView.unableUndo'))
+              }
+            } catch (error) {
+              showError({
+                title: t('choreView.undoFailed'),
+                message: t('choreView.undoFailedMessage'),
+              })
+            }
+          },
+        })
+      }
+    } catch (error) {
+      if (isNetworkError(error)) {
+        const cmdId = await commandQueue.enqueue(
+          CommandType.COMPLETE_CHORE,
+          choreId,
+          {
+            id: choreId,
+            body: impersonatedUser
+              ? { completedBy: impersonatedUser.userId, note }
+              : { note },
+            completedDate: completedDate || null,
+            performer: null,
+          },
+        )
+        await offlineDB.savePendingHistory({
+          id: -Date.now(),
+          choreId: Number(choreId),
+          completedBy: impersonatedUser?.userId || userProfile?.id || 0,
+          performedAt: completedDate || new Date().toISOString(),
+          dueDate: chore.nextDueDate || null,
+          notes: note || null,
+          status: 1,
+          points: chore.points || 0,
+          pending: true,
+        })
+        queryClient.invalidateQueries({ queryKey: ['pendingCommands'] })
+        showSuccess({
+          message: t('choreView.offlineComplete'),
+          undoAction: async () => {
+            await commandQueue.cancel(cmdId)
+            queryClient.invalidateQueries({ queryKey: ['pendingCommands'] })
+          },
+        })
+      } else {
+        showError({
+          title: t('choreView.undoFailed'),
+          message: error?.message || t('choreView.unableComplete'),
+        })
+      }
+    }
+  }
+  const handleSkippingTask = async () => {
+    try {
+      const response = await SkipChore(choreId)
+      if (response.ok) {
+        const data = await response.json()
+        setChore(data.res)
+        queryClient.invalidateQueries({ queryKey: ['chores'] })
+        showSuccess({
+          message: t('choreView.skipTask'),
+          undoAction: async () => {
+            try {
+              const undoResponse = await UndoChoreAction(choreId)
+              if (undoResponse.ok) {
+                const detailResponse = await GetChoreDetailById(choreId)
+                if (detailResponse.ok) {
+                  const detailData = await detailResponse.json()
+                  setChore(detailData.res)
+                  queryClient.invalidateQueries({ queryKey: ['chores'] })
+                }
+                showUndo({
+                  title: t('choreView.undoSuccessful'),
+                  message: t('choreView.taskSkipUndone'),
+                })
+              } else {
+                throw new Error(t('choreView.unableUndo'))
+              }
+            } catch (error) {
+              showError({
+                title: t('choreView.undoFailed'),
+                message: t('choreView.undoFailedMessage'),
+              })
+            }
+          },
+        })
+      }
+    } catch (error) {
+      if (isNetworkError(error)) {
+        const cmdId = await commandQueue.enqueue(
+          CommandType.SKIP_CHORE,
+          choreId,
+          { id: choreId },
+        )
+        queryClient.invalidateQueries({ queryKey: ['pendingCommands'] })
+        showSuccess({
+          message: t('choreView.offlineSkip'),
+          undoAction: async () => {
+            await commandQueue.cancel(cmdId)
+            queryClient.invalidateQueries({ queryKey: ['pendingCommands'] })
+          },
+        })
+      } else {
+        showError({
+          title: t('choreView.undoFailed'),
+          message: error?.message || t('choreView.unableSkip'),
+        })
+      }
+    }
+  }
+  const handleChoreStart = () => {
+    const startedChore = { ...chore, status: ChoreStatus.ACTIVE }
+    startChore.mutate(choreId, {
+      onSuccess: data => {
+        const newChore = {
+          ...chore,
+          ...data.res,
+        }
+        setChore(newChore)
+      },
+      onError: async error => {
+        if (isNetworkError(error)) {
+          const previousStatus = chore.status
+          const cmdId = await commandQueue.enqueue(
+            CommandType.START_CHORE,
+            choreId,
+            { id: choreId },
+          )
+          setChore(startedChore)
+          queryClient.invalidateQueries({ queryKey: ['pendingCommands'] })
+          showSuccess({
+            message: t('choreView.offlineStart'),
+            undoAction: async () => {
+              await commandQueue.cancel(cmdId)
+              queryClient.invalidateQueries({ queryKey: ['pendingCommands'] })
+              setChore({ ...chore, status: previousStatus })
+            },
+          })
+          return
+        }
+
+        showError({
+          title: t('choreView.undoFailed'),
+          message: error?.message || t('choreView.unableStart'),
+        })
+      },
+    })
+  }
+
+  const handleChorePause = () => {
+    const pausedChore = { ...chore, status: ChoreStatus.PAUSED }
+    pauseChore.mutate(choreId, {
+      onSuccess: data => {
+        const newChore = {
+          ...chore,
+          ...data.res,
+        }
+        setChore(newChore)
+      },
+      onError: async error => {
+        if (isNetworkError(error)) {
+          const previousStatus = chore.status
+          const cmdId = await commandQueue.enqueue(
+            CommandType.PAUSE_CHORE,
+            choreId,
+            { id: choreId },
+          )
+          setChore(pausedChore)
+          queryClient.invalidateQueries({ queryKey: ['pendingCommands'] })
+          showSuccess({
+            message: t('choreView.offlinePause'),
+            undoAction: async () => {
+              await commandQueue.cancel(cmdId)
+              queryClient.invalidateQueries({ queryKey: ['pendingCommands'] })
+              setChore({ ...chore, status: previousStatus })
+            },
+          })
+          return
+        }
+
+        showError({
+          title: t('choreView.undoFailed'),
+          message: error?.message || t('choreView.unablePause'),
+        })
+      },
+    })
+  }
+
+  const handleResetTimer = () => {
+    setTimerActionConfig({
+      isOpen: true,
+      title: t('choreView.resetTimer'),
+      message: t('choreView.resetTimerConfirmation'),
+      confirmText: t('choreView.resetTimer'),
+      cancelText: t('common:cancel'),
+      onClose: confirmed => {
+        if (confirmed) {
+          resetChoreTimer.mutate(choreId, {
+            onSuccess: data => {
+              const newChore = {
+                ...chore,
+                ...data.res,
+              }
+              setChore(newChore)
+            },
+          })
+        }
+        setTimerActionConfig({})
+      },
+    })
+  }
+
+  const handleClearAllTime = () => {
+    setTimerActionConfig({
+      isOpen: true,
+      title: t('choreView.clearAllTimeRecords'),
+      message: t('choreView.clearAllTimeConfirmation'),
+      confirmText: t('choreView.clearAllTimeRecords'),
+      cancelText: t('common:cancel'),
+      onClose: async confirmed => {
+        if (confirmed) {
+          if (choreTimer?.res?.id) {
+            deleteTimeSession.mutate(
+              { choreId, sessionId: choreTimer.res.id },
+              {
+                onSuccess: data => {
+                  const newChore = {
+                    ...chore,
+                    ...data.res,
+                  }
+                  setChore(newChore)
+                },
+              },
+            )
+          }
+        }
+        setTimerActionConfig({})
+      },
+    })
+  }
+
+  const handleApproveChore = () => {
+    ApproveChore(choreId).then(response => {
+      if (response.ok) {
+        response.json().then(data => {
+          setChore(data.res)
+          queryClient.invalidateQueries({ queryKey: ['chores'] })
+        })
+      }
+    })
+  }
+
+  const handleRejectChore = () => {
+    RejectChore(choreId).then(response => {
+      if (response.ok) {
+        response.json().then(data => {
+          setChore(data.res)
+          queryClient.invalidateQueries({ queryKey: ['chores'] })
+        })
+      }
+    })
+  }
+
+  const handleUnarchiveChore = async () => {
+    try {
+      const response = await UnArchiveChore(choreId)
+      if (response.ok) {
+        await offlineDB.saveChores([{ ...chore, isActive: true }])
+        setChore({ ...chore, isActive: true })
+        queryClient.invalidateQueries({ queryKey: ['chores'] })
+      }
+    } catch (error) {
+      const isNetworkError = err =>
+        err instanceof TypeError && err.message === 'Failed to fetch'
+      if (isNetworkError(error)) {
+        const cmdId = await commandQueue.enqueue(
+          CommandType.UNARCHIVE_CHORE,
+          choreId,
+          { id: choreId },
+        )
+        await offlineDB.saveChores([
+          { ...chore, isActive: true, _pending: 'unarchive' },
+        ])
+        setChore({ ...chore, isActive: true })
+        queryClient.invalidateQueries({ queryKey: ['pendingCommands'] })
+        showSuccess({
+          message: t('choreView.offlineRestore'),
+          undoAction: async () => {
+            await commandQueue.cancel(cmdId)
+            await offlineDB.saveChores([{ ...chore, isActive: false }])
+            setChore({ ...chore, isActive: false })
+            queryClient.invalidateQueries({ queryKey: ['pendingCommands'] })
+          },
+        })
+      } else {
+        showError({
+          title: t('choreView.restoreFailed'),
+          message: error.message || t('choreView.unableRestore'),
+        })
+      }
+    }
+  }
+
+  const confirmSkipTask = () => {
+    setConfirmModelConfig({
+      isOpen: true,
+      title: t('choreView.skipTask'),
+      message: t('choreView.skipTaskConfirmation'),
+      confirmText: t('choreView.skip'),
+      cancelText: t('choreView.cancel'),
+      onClose: confirmed => {
+        if (confirmed) {
+          handleSkippingTask()
+        }
+        setConfirmModelConfig({})
+      },
+    })
+  }
+
+  const handleArchiveChore = async () => {
+    try {
+      const response = await ArchiveChore(choreId)
+      if (response.ok) {
+        await offlineDB.saveChores([{ ...chore, isActive: false }])
+        setChore({ ...chore, isActive: false })
+        queryClient.invalidateQueries({ queryKey: ['chores'] })
+      }
+    } catch (error) {
+      showError({
+        title: t('choreView.failedArchive'),
+        message: error?.message || t('choreView.unableArchiveTask'),
+      })
+    }
+  }
+
+  const confirmDeleteChore = () => {
+    setConfirmModelConfig({
+      isOpen: true,
+      title: t('choreView.deleteTaskTitle'),
+      message: t('choreView.deleteTaskMessage'),
+      confirmText: t('common:delete'),
+      cancelText: t('choreView.cancel'),
+      onClose: async confirmed => {
+        setConfirmModelConfig({})
+        if (!confirmed) return
+        try {
+          const response = await DeleteChore(choreId)
+          if (response.ok) {
+            queryClient.invalidateQueries({ queryKey: ['chores'] })
+            showSuccess({
+              title: t('choreView.taskDeletedTitle'),
+              message: t('choreView.taskDeletedMessage'),
+            })
+            navigate('/chores')
+          }
+        } catch (error) {
+          showError({
+            title: t('choreView.failedDelete'),
+            message: error?.message || t('choreView.unableDeleteTask'),
+          })
+        }
+      },
+    })
+  }
+
+  const handleDueDateChange = async newDate => {
+    try {
+      const response = await UpdateDueDate(choreId, newDate)
+      if (response.ok) {
+        setChore(prev => ({ ...prev, nextDueDate: newDate }))
+        queryClient.invalidateQueries({ queryKey: ['chores'] })
+      }
+    } catch (error) {
+      showError({
+        title: t('choreView.failedReschedule'),
+        message: error?.message || t('choreView.unableChangeDueDate'),
+      })
+    }
+  }
+
+  const handleMoveToProject = async project => {
+    const projectId = project?.id ?? null
+    try {
+      const response = await SaveChore({ ...chore, projectId })
+      if (response.ok) {
+        setChore(prev => ({ ...prev, projectId }))
+        queryClient.invalidateQueries({ queryKey: ['chores'] })
+        showSuccess({
+          title: t('choreView.taskMovedTitle'),
+          message: t('choreView.taskMovedMessage', {
+            project: project?.name || t('actionMenu.defaultProject'),
+          }),
+        })
+      }
+    } catch (error) {
+      showError({
+        title: t('choreView.failedMoveTask'),
+        message: error?.message || t('choreView.unableMoveTaskToProject'),
+      })
+    }
+  }
+
+  const handleNudge = async ({ message, notifyAllAssignees }) => {
+    try {
+      const response = await NudgeChore(choreId, {
+        message,
+        notifyAllAssignees,
+      })
+      if (!response.ok) {
+        throw new Error(t('choreView.failedSendNudgeError'))
+      }
+      const data = await response.json()
+      showSuccess({
+        title: t('choreView.nudgeSentTitle'),
+        message: data.message || t('choreView.nudgeSentMessage'),
+      })
+    } catch (error) {
+      showError({
+        title: t('choreView.failedSendNudgeTitle'),
+        message: error?.message || t('choreView.unableSendNudge'),
+      })
+    }
+  }
+
+  // Picking a circle member who isn't yet in the chore's assignee pool must
+  // not surface the backend's "assignee not in assignees list" rejection —
+  // assigning someone should always just work, so this adds them to the pool
+  // first (existing per-chore state, no dedicated endpoint for it) and only
+  // then assigns.
+  const handleAssigneeChange = async assigneeId => {
+    try {
+      const isInPool = (chore.assignees || []).some(
+        a => a.userId === assigneeId,
+      )
+      if (!isInPool) {
+        const saveResponse = await SaveChore({
+          ...chore,
+          assignees: [...(chore.assignees || []), { userId: assigneeId }],
+        })
+        if (!saveResponse.ok)
+          throw new Error(t('choreView.unableChangeAssignee'))
+      }
+      const response = await UpdateChoreAssignee(chore.id, assigneeId)
+      if (!response.ok) throw new Error(t('choreView.unableChangeAssignee'))
+      const data = await response.json()
+      setChore(data.res)
+      queryClient.invalidateQueries({ queryKey: ['chores'] })
+    } catch (error) {
+      showError({
+        title: t('choreView.failedDelegate'),
+        message: error?.message || t('choreView.unableChangeAssignee'),
+      })
+    }
+  }
+
+  // Actions the menu raises that ChoreView owns; the rest of its items either
+  // navigate on their own or come in through the dedicated callbacks.
+  const handleMenuAction = (type, _chore, extraData) => {
+    switch (type) {
+      case 'skip':
+        confirmSkipTask()
+        break
+      case 'archive':
+        handleArchiveChore()
+        break
+      case 'unarchive':
+        handleUnarchiveChore()
+        break
+      case 'delete':
+        confirmDeleteChore()
+        break
+      case 'changeDueDate':
+        handleDueDateChange(extraData?.date?.toISOString() ?? null)
+        break
+      case 'moveToProject':
+        handleMoveToProject(extraData?.project)
+        break
+      default:
+        break
+    }
+  }
+
+  // Check if the current user can approve/reject (admin, manager, or task owner)
+  const canApproveReject = () => {
+    if (!circleMembersData?.res || !chore) return false
+
+    const currentUser = circleMembersData.res.find(
+      member => member.userId === (impersonatedUser?.userId || userProfile?.id),
+    )
+
+    // User can approve/reject if they are:
+    // 1. Admin or manager of the circle
+    // 2. Owner/creator of the task
+    return (
+      currentUser?.role === 'admin' ||
+      currentUser?.role === 'manager' ||
+      chore.createdBy === (impersonatedUser?.userId || userProfile?.id)
+    )
+  }
+
+  if (isChoreLoading || isCircleMembersLoading) {
+    // while loading the chore or circle members, return a loading state
+    return <LoadingComponent />
+  }
+  if (isChoreError) {
+    return (
+      <Container maxWidth='sm'>
+        <EmptyState
+          variant='error'
+          fullHeight
+          icon={<Checklist />}
+          title={t('choreView.notFoundTitle')}
+          description={t('choreView.notFoundDescription')}
+          primaryAction={{ label: t('archived.backToTasks'), to: '/chores' }}
+        />
+      </Container>
+    )
+  }
+  return (
+    <Container
+      maxWidth='sm'
+      sx={{
+        display: 'flex',
+        flexDirection: 'column',
+        width: '100%',
+        minWidth: 0,
+        overflowX: 'hidden',
+      }}
+    >
+      <Box
+        sx={{
+          display: 'flex',
+          flexDirection: 'column',
+          justifyContent: 'center',
+          alignItems: 'center',
+          textAlign: 'center',
+          mb: 1,
+        }}
+      >
+        <Box
+          sx={{
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            gap: 1,
+            mt: 1,
+            mb: 0.5,
+          }}
+        >
+          <Typography level='h3'>{chore.name}</Typography>
+          <PendingBadge commands={pendingCmds} />
+        </Box>
+        {chore.isActive === false && (
+          <Chip
+            startDecorator={<Archive />}
+            size='md'
+            color='warning'
+            sx={{ mb: 1 }}
+          >
+            {t('choreView.archive')}
+          </Chip>
+        )}
+        <Chip startDecorator={<CalendarMonth />} size='md' sx={{ mb: 1 }}>
+          {chore.nextDueDate
+            ? `${t('choreView.due')} ${fmt.dateTime(chore.nextDueDate)}`
+            : t('choreView.na')}
+        </Chip>
+        <Box
+          sx={{
+            display: 'flex',
+            flexDirection: 'row',
+            justifyContent: 'center',
+            alignItems: 'center',
+            mb: 1,
+            flexWrap: 'wrap',
+            gap: 0.5,
+          }}
+        >
+          {chore?.labelsV2?.map((label, index) => (
+            <Chip
+              key={index}
+              sx={{
+                backgroundColor: label?.color,
+                color: getTextColorFromBackgroundColor(label?.color),
+              }}
+            >
+              {label?.name}
+            </Chip>
+          ))}
+
+          {chore?.attachments?.length > 0 && (
+            <Chip
+              startDecorator={<AttachFile />}
+              size='md'
+              variant='soft'
+              color='neutral'
+              onClick={() => setAttachmentBrowserOpen(true)}
+              sx={{ cursor: 'pointer' }}
+            >
+              {t('choreView.attachment', { count: chore.attachments.length })}
+            </Chip>
+          )}
+        </Box>
+      </Box>
+
+      <Box>
+        <Grid
+          container
+          spacing={1}
+          sx={{
+            mb: 1,
+          }}
+        >
+          {[ChoreStatus.ACTIVE, ChoreStatus.PAUSED].includes(chore.status) && (
+            <Grid xs={12}>
+              <TimePassedCard
+                chore={chore}
+                handleAction={action => {
+                  if (action === 'pause') {
+                    handleChorePause()
+                  } else if (
+                    action === 'resume' &&
+                    !notInCompletionWindow(chore)
+                  ) {
+                    handleChoreStart()
+                  }
+                }}
+                onShowDetails={() => navigate(`/chores/${choreId}/timer`)}
+              />
+            </Grid>
+          )}
+          {infoCards.map((card, index) => (
+            <Grid xs={6} sm={6} key={index}>
+              <Card
+                variant='soft'
+                sx={{
+                  borderRadius: 'md',
+                  boxShadow: 1,
+                  px: 2,
+                  py: 1,
+                  minHeight: 90,
+                  height: '100%',
+                  // change from space-between to start:
+                  justifyContent: 'start',
+                }}
+              >
+                <CardContent>
+                  <Box
+                    sx={{
+                      display: 'flex',
+                      alignItems: 'center',
+                      justifyContent: 'start',
+                      mb: 0.5,
+                    }}
+                  >
+                    {card.icon}
+
+                    <Typography
+                      level='body-md'
+                      sx={{
+                        ml: 1,
+                        fontWeight: '500',
+                        color: 'text.primary',
+                      }}
+                    >
+                      {card.title}
+                    </Typography>
+                  </Box>
+                  <Box>
+                    <Typography
+                      level='body-sm'
+                      sx={{ color: 'text.secondary', lineHeight: 1.5 }}
+                    >
+                      {card.text}
+                    </Typography>
+                    <Typography
+                      level='body-sm'
+                      sx={{ color: 'text.secondary', lineHeight: 1.5 }}
+                    >
+                      {card.subtext}
+                    </Typography>
+                    {card.subtext2 && (
+                      <Typography
+                        level='body-sm'
+                        sx={{ color: 'danger.plainColor', lineHeight: 1.5 }}
+                      >
+                        {card.subtext2}
+                      </Typography>
+                    )}
+                  </Box>
+                </CardContent>
+              </Card>
+            </Grid>
+          ))}
+        </Grid>
+        <Box
+          sx={{
+            display: 'flex',
+            flexDirection: 'row',
+            gap: 1,
+            alignContent: 'center',
+            justifyContent: 'center',
+            mb: 1,
+          }}
+        >
+          <Button
+            size='sm'
+            color='neutral'
+            variant='plain'
+            fullWidth
+            onClick={() => {
+              navigate(`/chores/${choreId}/history`)
+            }}
+            sx={{
+              flexDirection: 'column',
+              alignItems: 'center',
+              justifyContent: 'center',
+              p: 1,
+            }}
+          >
+            <History />
+            {t('choreView.history')}
+          </Button>
+          <Button
+            size='sm'
+            color='neutral'
+            variant='plain'
+            fullWidth
+            sx={{
+              // top right of the card:
+              flexDirection: 'column',
+              alignItems: 'center',
+              justifyContent: 'center',
+              p: 1,
+            }}
+            onClick={() => {
+              navigate(`/chores/${choreId}/edit`)
+            }}
+          >
+            <Edit />
+            {t('choreView.edit')}
+          </Button>
+          <ChoreActionMenu
+            chore={chore}
+            hiddenActions={['view']}
+            onAction={handleMenuAction}
+            onNudge={() => setActiveModal('nudge')}
+            onWriteNFC={() => setActiveModal('writeNFC')}
+            onCompleteWithNote={() => setNote('')}
+            onCompleteWithPastDate={() =>
+              setCompletedDate(moment(new Date()).format('YYYY-MM-DDTHH:00:00'))
+            }
+            onChangeAssignee={() => setActiveModal('changeAssignee')}
+            onChangeDueDate={() => setActiveModal('changeDueDate')}
+            onChangePriority={handleUpdatePriority}
+            onDelete={confirmDeleteChore}
+            trigger={
+              <Button
+                size='sm'
+                color='neutral'
+                variant='plain'
+                fullWidth
+                sx={{
+                  flexDirection: 'column',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  p: 1,
+                }}
+              >
+                <MoreVert />
+                {t('choreView.more', 'More')}
+              </Button>
+            }
+          />
+        </Box>
+
+        {chore.description && (
+          <>
+            <Typography level='title-md' sx={{ mb: 1 }}>
+              {t('choreView.description')}
+            </Typography>
+
+            <Sheet
+              variant='plain'
+              sx={{
+                p: 2,
+                borderRadius: 'lg',
+                mb: 1,
+                cursor: 'pointer',
+              }}
+              onClick={() => {
+                setNoteViewerConfig({
+                  isOpen: true,
+                  title: t('choreView.descriptionTitle'),
+                  content: chore.description,
+                  onClose: () => setNoteViewerConfig({ isOpen: false }),
+                })
+              }}
+            >
+              <IconButton
+                variant='plain'
+                size='sm'
+                sx={{
+                  position: 'absolute',
+                  bottom: 5,
+                  right: 5,
+                }}
+              >
+                <OpenInFull />
+              </IconButton>
+              <Box
+                sx={{
+                  maxHeight: '100px',
+                  overflow: 'hidden',
+                }}
+              >
+                {(() => {
+                  const raw = chore.description || ''
+                  const shouldRenderHtml = hasHtmlTags(raw)
+
+                  return shouldRenderHtml ? (
+                    <Box
+                      sx={{
+                        whiteSpace: 'pre-wrap',
+                        wordBreak: 'break-word',
+                      }}
+                      dangerouslySetInnerHTML={{ __html: descriptionHtml }}
+                    />
+                  ) : (
+                    <Typography
+                      level='body-md'
+                      sx={{
+                        whiteSpace: 'pre-wrap',
+                        wordBreak: 'break-word',
+                      }}
+                    >
+                      {decodeHtmlEntities(raw)}
+                    </Typography>
+                  )
+                })()}
+              </Box>
+            </Sheet>
+          </>
+        )}
+
+        {chore.notes && (
+          <>
+            <Typography level='title-md' sx={{ mb: 1 }}>
+              {t('choreView.previousNoteLabel')}
+            </Typography>
+            <Sheet
+              variant='plain'
+              sx={{
+                p: 2,
+                borderRadius: 'lg',
+                mb: 1,
+                cursor: 'pointer',
+              }}
+              onClick={() => {
+                setNoteViewerConfig({
+                  isOpen: true,
+                  title: t('choreView.previousNote'),
+                  content: chore.notes,
+                  onClose: () => setNoteViewerConfig({ isOpen: false }),
+                })
+              }}
+            >
+              <IconButton
+                variant='plain'
+                size='sm'
+                sx={{
+                  position: 'absolute',
+                  bottom: 5,
+                  right: 5,
+                }}
+              >
+                <OpenInFull />
+              </IconButton>
+              <Box
+                sx={{
+                  maxHeight: '100px',
+                  overflow: 'hidden',
+                }}
+              >
+                {(() => {
+                  const raw = chore.notes || ''
+                  const shouldRenderHtml = hasHtmlTags(raw)
+
+                  return shouldRenderHtml ? (
+                    <Box
+                      sx={{
+                        whiteSpace: 'pre-wrap',
+                        wordBreak: 'break-word',
+                      }}
+                      dangerouslySetInnerHTML={{ __html: notesHtml }}
+                    />
+                  ) : (
+                    <Typography
+                      level='body-md'
+                      sx={{
+                        whiteSpace: 'pre-wrap',
+                        wordBreak: 'break-word',
+                      }}
+                    >
+                      {decodeHtmlEntities(raw)}
+                    </Typography>
+                  )
+                })()}
+              </Box>
+            </Sheet>
+          </>
+        )}
+        {chore.subTasks && chore.subTasks.length > 0 && (
+          <Box sx={{ p: 0, m: 0, mb: 2 }}>
+            <Typography level='title-md' sx={{ mb: 1 }}>
+              {t('choreView.subtasksLabel')}
+            </Typography>
+            <Sheet
+              variant='plain'
+              sx={{
+                borderRadius: 'lg',
+                p: 1,
+                overflow: 'auto',
+                // maxHeight: '100px',
+              }}
+            >
+              <SubTasks
+                editMode={false}
+                performers={performers}
+                tasks={chore.subTasks}
+                setTasks={tasks => {
+                  setChore({
+                    ...chore,
+                    subTasks: tasks,
+                  })
+                }}
+                choreId={choreId}
+              />
+            </Sheet>
+          </Box>
+        )}
+      </Box>
+
+      <Card
+        sx={{
+          p: 2,
+          borderRadius: 'md',
+          boxShadow: 'sm',
+          paddingBottom: getSafeBottomPadding(2, '8px'),
+        }}
+        variant='soft'
+      >
+        <Typography level='body-md' sx={{ mb: 1 }}>
+          {t('choreView.taskActions')}
+        </Typography>
+
+        <FormControl size='sm'>
+          <Checkbox
+            checked={note !== null}
+            size='lg'
+            disabled={chore.isActive === false}
+            onChange={e => {
+              if (e.target.checked) {
+                setNote('')
+              } else {
+                setNote(null)
+              }
+            }}
+            overlay
+            label={
+              <Typography
+                level='body-sm'
+                sx={{
+                  display: 'flex',
+                  alignItems: 'center',
+                }}
+              >
+                {t('choreView.addNote')}
+              </Typography>
+            }
+          />
+        </FormControl>
+        {note !== null && (
+          <Box sx={{ mb: 1 }}>
+            <Typography level='body-sm' sx={{ mb: 1 }}>
+              {t('choreView.additionalNotes')}
+            </Typography>
+            <RichTextEditor
+              value={note || ''}
+              onChange={setNote}
+              entityId={chore?.id}
+              entityType={'chore_completion_note'}
+              placeholder={t('choreView.notePlaceholder')}
+            />
+          </Box>
+        )}
+
+        <FormControl size='sm'>
+          <Checkbox
+            checked={completedDate !== null}
+            size='lg'
+            disabled={chore.isActive === false}
+            onChange={e => {
+              if (e.target.checked) {
+                setCompletedDate(
+                  moment(new Date()).format('YYYY-MM-DDTHH:00:00'),
+                )
+              } else {
+                setCompletedDate(null)
+              }
+            }}
+            overlay
+            sx={
+              {
+                // my: 1,
+              }
+            }
+            label={
+              <Typography
+                level='body-sm'
+                sx={{
+                  // center vertically
+                  display: 'flex',
+                  alignItems: 'center',
+                }}
+              >
+                {t('choreView.setCustomCompletionTime')}
+              </Typography>
+            }
+          />
+        </FormControl>
+        {completedDate !== null && (
+          <Input
+            sx={{ mt: 1, mb: 1.5, width: 300 }}
+            type='datetime-local'
+            value={completedDate}
+            onChange={e => {
+              setCompletedDate(e.target.value)
+            }}
+          />
+        )}
+
+        {chore.isActive === false ? (
+          // Archived chore - only show unarchive button
+          <Box
+            sx={{
+              display: 'flex',
+              flexDirection: 'column',
+              gap: 1,
+              alignContent: 'center',
+              justifyContent: 'center',
+            }}
+          >
+            <Button
+              fullWidth
+              size='lg'
+              onClick={handleUnarchiveChore}
+              color='primary'
+              startDecorator={<Unarchive />}
+            >
+              {t('choreView.unarchive')}
+            </Button>
+          </Box>
+        ) : (
+          // Active chore - show all normal actions
+          <Box
+            sx={{
+              display: 'flex',
+              flexDirection: 'column',
+              gap: 1,
+              alignContent: 'center',
+              justifyContent: 'center',
+            }}
+          >
+            <Box
+              sx={{
+                display: 'flex',
+                flexDirection: 'row',
+                gap: 1,
+                alignContent: 'center',
+                justifyContent: 'center',
+                mb: 1,
+              }}
+            >
+              {chore.status === 3 ? (
+                // Pending approval: Show approve/reject for admins/managers/owners, grayed out button for others
+                canApproveReject() ? (
+                  <>
+                    <Button
+                      fullWidth
+                      size='lg'
+                      onClick={handleApproveChore}
+                      color='success'
+                      startDecorator={<ThumbUp />}
+                      sx={{
+                        flex: 1,
+                      }}
+                    >
+                      {t('choreView.approve')}
+                    </Button>
+                    <Button
+                      fullWidth
+                      size='lg'
+                      onClick={handleRejectChore}
+                      color='danger'
+                      startDecorator={<ThumbDown />}
+                      sx={{
+                        flex: 1,
+                      }}
+                    >
+                      <Box>{t('choreView.reject')}</Box>
+                    </Button>
+                  </>
+                ) : (
+                  <Button
+                    fullWidth
+                    size='lg'
+                    disabled={true}
+                    color='neutral'
+                    startDecorator={<HourglassEmpty />}
+                  >
+                    <Box>{t('choreView.pendingApproval')}</Box>
+                  </Button>
+                )
+              ) : (
+                // Normal completion flow
+                <>
+                  <Button
+                    fullWidth
+                    size='lg'
+                    onClick={handleTaskCompletion}
+                    disabled={
+                      notInCompletionWindow(chore) || chore.isActive === false
+                    }
+                    color='success'
+                    startDecorator={<Check />}
+                    sx={{
+                      flex: 4,
+                    }}
+                  >
+                    <Box>{t('choreView.markAsDone')}</Box>
+                  </Button>
+
+                  <Button
+                    fullWidth
+                    size='lg'
+                    onClick={confirmSkipTask}
+                    disabled={
+                      notInCompletionWindow(chore) || chore.isActive === false
+                    }
+                    startDecorator={<SwitchAccessShortcut />}
+                    sx={{
+                      flex: 1,
+                    }}
+                  >
+                    <Box>{t('choreView.skip')}</Box>
+                  </Button>
+                </>
+              )}
+            </Box>
+            {notInCompletionWindow(chore) && (
+              <Typography
+                level='body-sm'
+                sx={{ color: 'warning.plainColor', textAlign: 'center', mb: 1 }}
+              >
+                {t('choreView.availableToCompleteStarting', {
+                  date: moment(chore.nextDueDate)
+                    .subtract(chore.completionWindow, 'hours')
+                    .format('MM/DD/YYYY hh:mm A'),
+                })}
+              </Typography>
+            )}
+            {/* Timer Button - Show split button when timer is active, regular button otherwise */}
+            {[ChoreStatus.ACTIVE, ChoreStatus.PAUSED].includes(chore.status) ? (
+              <TimerSplitButton
+                disabled={
+                  (chore.status === ChoreStatus.PAUSED &&
+                    notInCompletionWindow(chore)) ||
+                  chore.isActive === false
+                }
+                chore={chore}
+                onAction={action => {
+                  if (action === 'pause') {
+                    handleChorePause()
+                  } else if (action === 'resume') {
+                    handleChoreStart()
+                  }
+                }}
+                onShowDetails={() => navigate(`/chores/${choreId}/timer`)}
+                onResetTimer={handleResetTimer}
+                onClearAllTime={handleClearAllTime}
+                fullWidth
+              />
+            ) : chore.status === ChoreStatus.PENDING_APPROVAL ? (
+              <></>
+            ) : (
+              <Button
+                size='lg'
+                onClick={() => {
+                  handleChoreStart()
+                }}
+                variant='soft'
+                color='success'
+                disabled={
+                  notInCompletionWindow(chore) || chore.isActive === false
+                }
+                startDecorator={<PlayArrow />}
+                sx={{
+                  flex: 1,
+                }}
+              >
+                {t('choreView.start')}
+              </Button>
+            )}
+          </Box>
+        )}
+
+        <ConfirmationModal config={confirmModelConfig} />
+        <ConfirmationModal config={timerActionConfig} />
+        <NoteViewerModal config={noteViewerConfig} />
+        {activeModal === 'changeDueDate' && (
+          <DueDatePickerModal
+            open={true}
+            title={t('choreView.changeDueDate', 'Change due date')}
+            {...splitDueDate(chore.nextDueDate)}
+            onClose={() => setActiveModal(null)}
+            onApply={parts => {
+              handleDueDateChange(combineDueDate(parts)?.toISOString() ?? null)
+              setActiveModal(null)
+            }}
+            onRemove={() => {
+              handleDueDateChange(null)
+              setActiveModal(null)
+            }}
+          />
+        )}
+        {activeModal === 'changeAssignee' && (
+          <AssigneeModal
+            isOpen={true}
+            members={performers}
+            assignedTo={chore.assignedTo}
+            title={t('choreView.delegateToSomeoneElse')}
+            onClose={() => setActiveModal(null)}
+            onSave={handleAssigneeChange}
+          />
+        )}
+        {activeModal === 'nudge' && (
+          <NudgeModal
+            config={{
+              isOpen: true,
+              choreId: chore.id,
+              onClose: () => setActiveModal(null),
+              onConfirm: handleNudge,
+            }}
+          />
+        )}
+        {activeModal === 'writeNFC' && (
+          <WriteNFCModal
+            config={{
+              isOpen: true,
+              url: getNFCUrl(choreId),
+              onClose: () => setActiveModal(null),
+            }}
+          />
+        )}
+        <AttachmentBrowserModal
+          choreId={choreId}
+          isOpen={attachmentBrowserOpen}
+          onClose={() => setAttachmentBrowserOpen(false)}
+        />
+      </Card>
+    </Container>
+  )
+}
+
+export default ChoreView

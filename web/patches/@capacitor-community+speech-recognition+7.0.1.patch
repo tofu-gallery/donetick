@@ -1,0 +1,113 @@
+diff --git a/node_modules/@capacitor-community/speech-recognition/android/src/main/java/com/getcapacitor/community/speechrecognition/SpeechRecognition.java b/node_modules/@capacitor-community/speech-recognition/android/src/main/java/com/getcapacitor/community/speechrecognition/SpeechRecognition.java
+index a99ea69..c23a350 100644
+--- a/node_modules/@capacitor-community/speech-recognition/android/src/main/java/com/getcapacitor/community/speechrecognition/SpeechRecognition.java
++++ b/node_modules/@capacitor-community/speech-recognition/android/src/main/java/com/getcapacitor/community/speechrecognition/SpeechRecognition.java
+@@ -81,13 +81,18 @@ public class SpeechRecognition extends Plugin implements Constants {
+         String prompt = call.getString("prompt", null);
+         boolean partialResults = call.getBoolean("partialResults", false);
+         boolean popup = call.getBoolean("popup", false);
+-        beginListening(language, maxResults, prompt, partialResults, popup, call);
++        JSArray contextualStrings = call.getArray("contextualStrings", new JSArray());
++        beginListening(language, maxResults, prompt, partialResults, popup, contextualStrings, call);
+     }
+ 
+     @PluginMethod
+     public void stop(final PluginCall call) {
+         try {
+             stopListening();
++            // This never resolved the call on success, only rejected on
++            // exception — any caller doing `await stop()` (e.g. a JS-side
++            // restart loop) would hang forever waiting on this promise.
++            call.resolve();
+         } catch (Exception ex) {
+             call.reject(ex.getLocalizedMessage());
+         }
+@@ -157,6 +162,7 @@ public class SpeechRecognition extends Plugin implements Constants {
+         String prompt,
+         final boolean partialResults,
+         boolean showPopup,
++        JSArray contextualStrings,
+         PluginCall call
+     ) {
+         Logger.info(getLogTag(), "Beginning to listen for audible speech");
+@@ -168,6 +174,29 @@ public class SpeechRecognition extends Plugin implements Constants {
+         intent.putExtra(RecognizerIntent.EXTRA_CALLING_PACKAGE, bridge.getActivity().getPackageName());
+         intent.putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, partialResults);
+         intent.putExtra("android.speech.extra.DICTATION_MODE", partialResults);
++        // Only request the on-device recognizer for English: offline language
++        // packs for other locales (e.g. German, and especially Arabic, which
++        // many Android builds don't support on-device at all) are rarely
++        // downloaded, and forcing EXTRA_PREFER_OFFLINE then makes the
++        // recognizer fail (ERROR_LANGUAGE_NOT_SUPPORTED/ERROR_NO_MATCH) with
++        // no transcript — looking like the mic silently does nothing. Falling
++        // back to the server-based recognizer for non-English locales fixes
++        // that at the cost of losing the offline benefit for those languages.
++        if (language != null && language.toLowerCase(Locale.US).startsWith("en")) {
++            intent.putExtra(RecognizerIntent.EXTRA_PREFER_OFFLINE, true);
++        }
++        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU && contextualStrings != null && contextualStrings.length() > 0) {
++            ArrayList<String> biasingStrings = new ArrayList<>();
++            for (int i = 0; i < contextualStrings.length(); i++) {
++                String value = contextualStrings.optString(i, null);
++                if (value != null && !value.trim().isEmpty()) {
++                    biasingStrings.add(value);
++                }
++            }
++            if (!biasingStrings.isEmpty()) {
++                intent.putStringArrayListExtra(RecognizerIntent.EXTRA_BIASING_STRINGS, biasingStrings);
++            }
++        }
+ 
+         if (prompt != null) {
+             intent.putExtra(RecognizerIntent.EXTRA_PROMPT, prompt);
+@@ -283,6 +312,25 @@ public class SpeechRecognition extends Plugin implements Constants {
+             SpeechRecognition.this.stopListening();
+             String errorMssg = getErrorText(error);
+ 
++            // Unlike onEndOfSpeech, this previously never told the JS side the
++            // session ended — silence commonly ends a session via ERROR_SPEECH_TIMEOUT
++            // / ERROR_NO_MATCH rather than onEndOfSpeech, so without this the caller's
++            // restart loop never fires and listening state gets stuck forever.
++            bridge
++                .getWebView()
++                .post(() -> {
++                    try {
++                        SpeechRecognition.this.lock.lock();
++                        SpeechRecognition.this.listening(false);
++
++                        JSObject ret = new JSObject();
++                        ret.put("status", "stopped");
++                        SpeechRecognition.this.notifyListeners(LISTENING_EVENT, ret);
++                    } finally {
++                        SpeechRecognition.this.lock.unlock();
++                    }
++                });
++
+             if (this.call != null) {
+                 call.reject(errorMssg);
+             }
+diff --git a/node_modules/@capacitor-community/speech-recognition/ios/Plugin/Plugin.swift b/node_modules/@capacitor-community/speech-recognition/ios/Plugin/Plugin.swift
+index 5d1b35b..899c7a6 100644
+--- a/node_modules/@capacitor-community/speech-recognition/ios/Plugin/Plugin.swift
++++ b/node_modules/@capacitor-community/speech-recognition/ios/Plugin/Plugin.swift
+@@ -54,6 +54,7 @@ public class SpeechRecognition: CAPPlugin {
+             let language: String = call.getString("language") ?? "en-US"
+             let maxResults: Int = call.getInt("maxResults") ?? self.defaultMatches
+             let partialResults: Bool = call.getBool("partialResults") ?? false
++            let contextualStrings: [String] = call.getArray("contextualStrings", String.self) ?? []
+ 
+             if self.recognitionTask != nil {
+                 self.recognitionTask?.cancel()
+@@ -79,6 +80,12 @@ public class SpeechRecognition: CAPPlugin {
+ 
+             self.recognitionRequest = SFSpeechAudioBufferRecognitionRequest()
+             self.recognitionRequest?.shouldReportPartialResults = partialResults
++            if !contextualStrings.isEmpty {
++                self.recognitionRequest?.contextualStrings = contextualStrings
++            }
++            if #available(iOS 13, *), self.speechRecognizer?.supportsOnDeviceRecognition == true {
++                self.recognitionRequest?.requiresOnDeviceRecognition = true
++            }
+ 
+             let inputNode: AVAudioInputNode = self.audioEngine!.inputNode
+             let format: AVAudioFormat = inputNode.outputFormat(forBus: 0)

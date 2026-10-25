@@ -1,0 +1,2163 @@
+import {
+  Add,
+  AutoAwesome,
+  Close,
+  KeyboardArrowDown,
+  Lock,
+} from '@mui/icons-material'
+import {
+  Alert,
+  Box,
+  Button,
+  CircularProgress,
+  Dropdown,
+  IconButton,
+  ListItemDecorator,
+  Menu,
+  MenuButton,
+  MenuItem,
+  Typography,
+} from '@mui/joy'
+import { useMediaQuery } from '@mui/material'
+import { useQueryClient } from '@tanstack/react-query'
+import * as chrono from 'chrono-node'
+import moment from 'moment'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { flushSync } from 'react-dom'
+import { useTranslation } from 'react-i18next'
+
+import KeyboardShortcutHint from '../../components/common/KeyboardShortcutHint'
+import ModalActions from '../../components/common/ModalActions'
+import { useModalShortcutScope } from '../../contexts/KeyboardShortcutScopeContext'
+import { useDocumentScanner } from '../../hooks/useDocumentScanner'
+import { useFileUpload } from '../../hooks/useFileUpload'
+import { useResponsiveModal } from '../../hooks/useResponsiveModal'
+import { useCreateChore } from '../../queries/ChoreQueries'
+import { useCircleMembers, useUserProfile } from '../../queries/UserQueries'
+import { localAIService } from '../../service/LocalAIService'
+import {
+  fileToDataUrl,
+  sharedItemToFile,
+} from '../../service/ShareTargetService'
+import { voiceInputService } from '../../service/VoiceInputService'
+import LABEL_COLORS, { TASK_COLOR } from '../../utils/Colors'
+import { sanitizeRemindersForPlan } from '../../utils/entitlements'
+import { CreateLabel, DeleteDraftAttachment } from '../../utils/Fetcher'
+import { imageSourceToFile } from '../../utils/FileConvert'
+import { isPlusAccount } from '../../utils/Helpers'
+import {
+  filterMembersForProject,
+  getProjectAudienceIds,
+} from '../../utils/ProjectAccess'
+import { getIconComponent } from '../../utils/ProjectIcons'
+import { generateUUID } from '../../utils/UUID'
+import { useLabels } from '../Labels/LabelQueries'
+import { useProjects } from '../Projects/ProjectQueries'
+import AdvancedOptionsSection, {
+  AdvancedOptionsTrigger,
+} from './AdvancedOptionsSection'
+import AssigneePickerField from './AssigneePickerField'
+import AttachmentPickerField from './AttachmentPickerField'
+import {
+  parseAssignees,
+  parseDueDate,
+  parseLabels,
+  parsePoints,
+  parsePriority,
+  parseRepeatV2,
+} from './CustomParsers'
+import DueDatePickerField from './DueDatePickerField'
+import { combineDueDate } from './DueDatePickerModal'
+import LabelsPickerField from './LabelsPickerField'
+import NotificationPickerField from './NotificationPickerField'
+import PriorityPickerField from './PriorityPickerField'
+import RepeatPickerField from './RepeatPickerField'
+import RichTextEditor from './RichTextEditor'
+import ScanPanel from './ScanToTask/ScanPanel'
+import { extractTaskFromImage } from './ScanToTask/useScanToTask'
+import SmartTaskTitleInput from './SmartTaskTitleInput'
+import SubTasks from './SubTask'
+import { buildChorePayload, parseVoiceTask } from './VoiceToTask/parseVoiceTask'
+import VoicePanel from './VoiceToTask/VoicePanel'
+// Canonical reminder template shape, shared with NotificationTemplate and
+// LocalNotificationScheduler: a signed value plus 'm' | 'h' | 'd'. Negative is
+// before due, positive is after, zero is on due.
+const DEFAULT_NOTIFICATION_TEMPLATES = [
+  { value: -1, unit: 'd' },
+  { value: 0, unit: 'm' },
+  { value: 1, unit: 'd' },
+]
+
+const UNIT_ALIASES = {
+  minute: 'm',
+  minutes: 'm',
+  hour: 'h',
+  hours: 'h',
+  day: 'd',
+  days: 'd',
+}
+
+// Earlier builds stored {value: 1, unit: 'days', type: 'before'}. Nothing reads
+// `type`, and the scheduler's unit switch falls through on 'days', so those
+// entries fired at the due time (or collided on id) instead of offsetting.
+const normalizeTemplate = template => {
+  const unit = UNIT_ALIASES[template.unit] || template.unit
+  const value = Number(template.value) || 0
+  if (!template.type) return { value, unit }
+  if (template.type === 'ondue') return { value: 0, unit }
+  return {
+    value: template.type === 'before' ? -Math.abs(value) : Math.abs(value),
+    unit,
+  }
+}
+
+const getDefaultNotification = () => {
+  const storedDefault = localStorage.getItem('defaultNotificationTemplate')
+  if (storedDefault) {
+    try {
+      const parsed = JSON.parse(storedDefault)
+      if (Array.isArray(parsed)) {
+        // An empty list is a deliberate "no reminders by default", not a
+        // missing value — respect it instead of re-seeding.
+        const normalized = parsed.map(normalizeTemplate)
+        if (JSON.stringify(normalized) !== storedDefault) {
+          localStorage.setItem(
+            'defaultNotificationTemplate',
+            JSON.stringify(normalized),
+          )
+        }
+        return normalized
+      }
+    } catch {
+      // fall through and reset to the defaults below
+    }
+  }
+
+  localStorage.setItem(
+    'defaultNotificationTemplate',
+    JSON.stringify(DEFAULT_NOTIFICATION_TEMPLATES),
+  )
+  return DEFAULT_NOTIFICATION_TEMPLATES
+}
+
+// Get initial project from localStorage (current active project)
+const getInitialProject = () => {
+  const saved = localStorage.getItem('selectedProject')
+  if (saved) {
+    try {
+      const project = JSON.parse(saved)
+      return project?.id || 'default'
+    } catch {
+      return 'default'
+    }
+  }
+  return 'default'
+}
+
+const DEFAULT_PROJECT = {
+  id: 'default',
+  name: 'Default Project',
+  color: '#9CA3AF',
+  icon: 'FolderOpen',
+}
+
+const PRIORITY_COLORS = {
+  0: TASK_COLOR.NO_PRIORITY,
+  1: TASK_COLOR.PRIORITY_1,
+  2: TASK_COLOR.PRIORITY_2,
+  3: TASK_COLOR.PRIORITY_3,
+  4: TASK_COLOR.PRIORITY_4,
+}
+
+const PRIORITY_LABELS = {
+  0: '--',
+  1: 'P1',
+  2: 'P2',
+  3: 'P3',
+  4: 'P4',
+}
+
+// Static option sets for the smart input's trigger suggestions
+const PRIORITY_SUGGESTIONS = {
+  value: 'id',
+  display: 'name',
+  options: [
+    { id: '1', name: 'P1' },
+    { id: '2', name: 'P2' },
+    { id: '3', name: 'P3' },
+    { id: '4', name: 'P4' },
+  ],
+}
+
+const POINTS_SUGGESTIONS = {
+  value: 'id',
+  display: 'name',
+  options: [
+    { id: '1', name: '1 point' },
+    { id: '5', name: '5 points' },
+    { id: '10', name: '10 points' },
+    { id: '25', name: '25 points' },
+    { id: '50', name: '50 points' },
+    { id: '100', name: '100 points' },
+  ],
+}
+
+// Delay between the last keystroke and the smart-input parse. Parsing (chrono
+// especially) is too heavy to run per keystroke; submitChore flushes a pending
+// parse so a fast type-then-Enter never creates from stale parsed state.
+const PARSE_DEBOUNCE_MS = 150
+
+const TaskInput = ({
+  initialMode,
+  initialShare,
+  isModalOpen,
+  onChoreUpdate,
+  onClose,
+}) => {
+  const { t } = useTranslation('chores')
+  // Claims the keyboard while open so background listeners (e.g. the project
+  // selector's own Cmd+E) know to stay out of the way — see
+  // KeyboardShortcutScopeContext.
+  const isShortcutScopeActive = useModalShortcutScope(isModalOpen)
+  const { ResponsiveModal } = useResponsiveModal()
+  const isMobile = useMediaQuery(theme => theme.breakpoints.down('sm'))
+  const pickerEmptyDisplay = isMobile ? 'icon' : 'icon-text'
+  const { data: userLabels, isLoading: userLabelsLoading } = useLabels()
+  const { data: circleMembers, isLoading: isCircleMembersLoading } =
+    useCircleMembers()
+  const { data: projects = [], isLoading: isProjectsLoading } = useProjects()
+  const createChoreMutation = useCreateChore()
+  const queryClient = useQueryClient()
+
+  const { data: userProfile } = useUserProfile()
+
+  // Stable identities for the voice panel: these queries are undefined while
+  // loading, and a fresh [] each render would churn the panel's parse context
+  const voiceLabels = useMemo(() => userLabels || [], [userLabels])
+
+  const handleCreateLabel = useCallback(
+    name => {
+      const color =
+        LABEL_COLORS[1 + Math.floor(Math.random() * (LABEL_COLORS.length - 1))]
+          .value
+      CreateLabel({ name, color })
+        .then(() => queryClient.invalidateQueries({ queryKey: ['labels'] }))
+        .catch(error => console.error('Error creating label:', error))
+    },
+    [queryClient],
+  )
+
+  const [taskText, setTaskText] = useState('')
+  const [taskTitle, setTaskTitle] = useState('')
+  // Highlight spans paired with the text they were computed from: the parse
+  // is debounced, so while typing these lag behind taskText
+  const [renderedParts, setRenderedParts] = useState({ text: '', parts: [] })
+
+  // What the smart input overlay shows. While a parse is pending, keep every
+  // highlight span that precedes the edit point and render the rest as plain
+  // text — existing token styles must not flicker away on each keystroke.
+  const displayedParts = useMemo(() => {
+    const { parts, text } = renderedParts
+    if (text === taskText) return parts
+
+    let prefixLen = 0
+    const max = Math.min(text.length, taskText.length)
+    while (prefixLen < max && text[prefixLen] === taskText[prefixLen]) {
+      prefixLen++
+    }
+
+    const kept = []
+    let consumed = 0
+    for (const part of parts) {
+      const partText = typeof part === 'string' ? part : part.props.children
+      if (consumed + partText.length > prefixLen) break
+      kept.push(part)
+      consumed += partText.length
+    }
+    kept.push(taskText.slice(consumed))
+    return kept
+  }, [renderedParts, taskText])
+
+  const richTextEditorRef = useRef(null)
+  const latestRef = useRef({})
+  // Picker edits made on a voice task card, applied once after the reparse
+  // that follows landing the spoken text in the smart input
+  const pendingVoiceOverridesRef = useRef(null)
+  // True while the current assignees came from an @mention in the text, so a
+  // reparse without mentions only resets what a mention set — never a
+  // selection made directly in the assignee picker
+  const assigneesFromMentionRef = useRef(false)
+  // Pending debounced parse of the smart input text, if any
+  const parseTimerRef = useRef(null)
+  // Identities (type + text) of the highlights from the previous parse, so
+  // the appear animation only plays for tokens detected just now
+  const prevHighlightKeysRef = useRef(new Set())
+  // Which capture method last populated the form, for chore_created's
+  // analytics `source` property. Reset to 'quick_add' whenever the modal
+  // closes — this is the AddTaskModal popup, distinct from the full-page
+  // create flow in ChoreEdit.jsx.
+  const taskSourceRef = useRef('quick_add')
+  const [priority, setPriority] = useState(0)
+  const [description, setDescription] = useState(null)
+  const [assignees, setAssignees] = useState([])
+  const [labelsV2, setLabelsV2] = useState([])
+  const [frequency, setFrequency] = useState(null)
+  // Lazy initializers: these read localStorage, which must not happen on
+  // every render
+  const [notificationMetadata, setNotificationMetadata] = useState(() => ({
+    templates: getDefaultNotification(),
+  }))
+  const [subTasks, setSubTasks] = useState(null)
+  const [points, setPoints] = useState(-1)
+  const [isAnyoneTask, setIsAnyoneTask] = useState(false)
+  const [hasDescription, setHasDescription] = useState(false)
+  const [hasSubTasks, setHasSubTasks] = useState(false)
+  const [deadlineOffset, setDeadlineOffset] = useState(-1)
+  const [requireApproval, setRequireApproval] = useState(false)
+  const [completionWindow, setCompletionWindow] = useState(-1)
+  const [assignStrategy, setAssignStrategy] = useState('keep_last_assigned')
+  const [isPrivate, setIsPrivate] = useState(false)
+  const [showAdvanced, setShowAdvanced] = useState(false)
+  const [dueDateOnly, setDueDateOnly] = useState(null)
+  const [dueTime, setDueTime] = useState(null)
+  const [useCustomTime, setUseCustomTime] = useState(false)
+  // These three are the source of truth; the due date is only their
+  // combination. It used to be a fourth piece of state that every handler
+  // recomputed for itself, which meant the picker's Apply — three callbacks
+  // in one batch — had each of them reading stale siblings and the chosen
+  // time losing to the end-of-day fallback.
+  const dueDate = useMemo(() => {
+    const combined = combineDueDate({ dueDateOnly, dueTime, useCustomTime })
+    return combined ? moment(combined).format('YYYY-MM-DDTHH:mm:ss') : null
+  }, [dueDateOnly, dueTime, useCustomTime])
+  const [showKeyboardShortcuts, setShowKeyboardShortcuts] = useState(false)
+  // Once "Create & add another" is picked, the primary button switches to
+  // that action for the rest of this modal session (until it closes) —
+  // picking it once means the user is batching tasks, not just this one.
+  const [continuousMode, setContinuousMode] = useState(false)
+  const [projectId, setProjectId] = useState(getInitialProject)
+  const selectedProject = useMemo(
+    () =>
+      (projectId !== 'default' &&
+        projects?.find(project => project.id === projectId)) ||
+      DEFAULT_PROJECT,
+    [projects, projectId],
+  )
+  const SelectedProjectIcon = useMemo(
+    () => getIconComponent(selectedProject.icon),
+    [selectedProject],
+  )
+  const [attachments, setAttachments] = useState([])
+
+  const [draftId, setDraftId] = useState(() => generateUUID())
+  const [showScan, setShowScan] = useState(false)
+  const [scanAutoCapture, setScanAutoCapture] = useState(false)
+  const [pendingPhotoUrl, setPendingPhotoUrl] = useState(null)
+  const [scanImageAlreadyAttached, setScanImageAlreadyAttached] =
+    useState(false)
+  const [isAttachingScan, setIsAttachingScan] = useState(false)
+  const [shareAnalysis, setShareAnalysis] = useState({
+    status: 'idle',
+    suggestion: null,
+    source: null,
+    hasAttachment: false,
+    attachmentPath: null,
+    analysisId: null,
+  })
+  // Async OCR may finish after the user dismisses it, closes the modal, or
+  // starts another task. Only the latest run is allowed to update the form.
+  const shareAnalysisRunRef = useRef(0)
+  const [removingSuggestedAttachment, setRemovingSuggestedAttachment] =
+    useState(false)
+  const [llmAvailable, setLlmAvailable] = useState(false)
+  const [showVoice, setShowVoice] = useState(false)
+  const [voiceAvailable, setVoiceAvailable] = useState(false)
+  // Voice capture state, reported up by VoicePanel so the modal footer owns
+  // the confirm action instead of the panel having its own button row
+  const [voiceState, setVoiceState] = useState({
+    segments: [],
+    isListening: false,
+  })
+  const [creatingVoiceTasks, setCreatingVoiceTasks] = useState(false)
+  // Reminder default the voice cards start from — read once so the array
+  // identity stays stable across renders of the panel
+  const voiceDefaultNotificationTemplates = useMemo(
+    () => getDefaultNotification(),
+    [],
+  )
+  // Same arrangement for the scan panel: it reports the action for its
+  // current phase and the modal footer renders it
+  const [scanState, setScanState] = useState({
+    phase: 'idle',
+    primaryAction: null,
+  })
+  const { isNativeScanner } = useDocumentScanner()
+  const { uploadFile } = useFileUpload({
+    entityType: 'chore_attachment_draft',
+    draftId,
+  })
+
+  useEffect(() => {
+    localAIService.isAvailable().then(setLlmAvailable)
+    voiceInputService.isSupported().then(setVoiceAvailable)
+  }, [])
+
+  // A task in a private or shared project is always private: the project's
+  // privacy wins over the task's own setting, so keep the form in sync with the
+  // selected project.
+  const taskProject = projects.find(project => project.id === projectId)
+  const selectedProjectIsPrivate = Boolean(taskProject?.isPrivate)
+  useEffect(() => {
+    if (selectedProjectIsPrivate && !isPrivate) {
+      setIsPrivate(true)
+    }
+  }, [selectedProjectIsPrivate, isPrivate])
+
+  // Only people who can see the selected project can be assigned (the server
+  // rejects anybody else), so the picker and @mentions offer just them.
+  const assignableMembers = useMemo(
+    () => filterMembersForProject(circleMembers?.res || [], taskProject),
+    [circleMembers, taskProject],
+  )
+
+  // Voice tasks land in the selected project as well, so they offer the same
+  // people (assignableMembers is memoized, so the panel's parse context stays put).
+  const voiceMembers = assignableMembers
+
+  const smartInputSuggestions = useMemo(
+    () => ({
+      '#': {
+        value: 'id',
+        display: 'name',
+        options: userLabels || [],
+        creatable: true,
+        onCreate: handleCreateLabel,
+      },
+      '!': PRIORITY_SUGGESTIONS,
+      '@': {
+        value: 'userId',
+        display: 'displayName',
+        options: [
+          { userId: 'anyone', displayName: t('addTask.anyone') },
+          ...assignableMembers,
+        ],
+      },
+      '*': POINTS_SUGGESTIONS,
+    }),
+    [userLabels, assignableMembers, handleCreateLabel, t],
+  )
+
+  const projectAudienceKey = (getProjectAudienceIds(taskProject) || []).join(
+    ',',
+  )
+  useEffect(() => {
+    const audience = getProjectAudienceIds(taskProject)
+    if (!audience) return
+    setAssignees(current => {
+      const kept = current.filter(a => audience.includes(a.userId))
+      return kept.length === current.length ? current : kept
+    })
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [projectAudienceKey])
+
+  // Quick-capture widget entry points (donetick://chores/add?mode=voice|scan)
+  // land here: open straight into the requested panel, once per modal open so
+  // backing out of the panel doesn't bounce the user right back into it.
+  const appliedInitialModeRef = useRef(false)
+  useEffect(() => {
+    if (!isModalOpen) {
+      appliedInitialModeRef.current = false
+      return
+    }
+    if (appliedInitialModeRef.current) return
+
+    // Availability resolves async — wait for the answer before deciding; if it
+    // never turns true the modal simply stays in plain text mode.
+    if (initialMode === 'voice') {
+      if (!voiceAvailable) return
+      appliedInitialModeRef.current = true
+      setShowVoice(true)
+    } else if (initialMode === 'scan') {
+      if (!llmAvailable) return
+      appliedInitialModeRef.current = true
+      setScanAutoCapture(true)
+      setShowScan(true)
+    }
+  }, [isModalOpen, initialMode, voiceAvailable, llmAvailable])
+
+  // set showKeyboardShortcuts true as soon as the user hold ctrl or cmd key:
+  useEffect(() => {
+    if (hasDescription && richTextEditorRef.current) {
+      // Small delay to ensure the component is fully rendered
+      setTimeout(() => {
+        richTextEditorRef.current.focus()
+      }, 100)
+    }
+  }, [hasDescription])
+
+  useEffect(() => {
+    const handleKeyDown = event => {
+      const {
+        dueDate,
+        handleCloseModal,
+        hasDescription,
+        isShortcutScopeActive,
+        submitChore,
+      } = latestRef.current
+      // Only the modal that currently owns the keyboard (the topmost open
+      // one, if this component is ever nested) should react at all —
+      // otherwise a background instance of this same component would also
+      // process keys meant for whatever's on top of it, including showing
+      // its own shortcut hints.
+      if (!isShortcutScopeActive) return
+      // Holding a key (or a fast physical double-tap that the OS coalesces
+      // into auto-repeat) re-fires 'keydown' for as long as it's down. None
+      // of the shortcuts below are meant to repeat — Cmd+J revealing
+      // subtasks a second time just steals focus away from wherever the
+      // user actually is.
+      if (event.repeat) return
+
+      const isHoldingCmd = event.ctrlKey || event.metaKey
+      if (isHoldingCmd) {
+        setShowKeyboardShortcuts(true)
+      }
+      if (isHoldingCmd && event.key.toLowerCase() === 'e' && !hasDescription) {
+        setHasDescription(true)
+        setShowKeyboardShortcuts(false)
+      }
+      if (isHoldingCmd && event.key.toLowerCase() === 'j') {
+        setHasSubTasks(true)
+        setShowKeyboardShortcuts(false)
+      }
+      if (isHoldingCmd && event.key.toLowerCase() === 'b' && !dueDate) {
+        const tomorrow = moment().add(1, 'day')
+        setDueDateOnly(tomorrow.format('YYYY-MM-DD'))
+        setUseCustomTime(false)
+        setDueTime(null)
+        setShowKeyboardShortcuts(false)
+      }
+      if (event.key === 'Enter' && isHoldingCmd) {
+        event.preventDefault()
+        submitChore()
+        return
+      }
+      if (event.key === 'Escape') {
+        event.preventDefault()
+        handleCloseModal()
+        return
+      }
+    }
+
+    const handleKeyUp = event => {
+      if (event.key === 'Control' || event.key === 'Meta') {
+        setShowKeyboardShortcuts(false)
+      }
+    }
+    window.addEventListener('keydown', handleKeyDown)
+    window.addEventListener('keyup', handleKeyUp)
+    return () => {
+      window.removeEventListener('keydown', handleKeyDown)
+      window.removeEventListener('keyup', handleKeyUp)
+    }
+  }, [])
+
+  const renderHighlightedSentence = useCallback(
+    (
+      sentence,
+      repeatHighlight,
+      priorityHighlight,
+      labelsHighlight,
+      dueDateHighlight,
+      pointsHighlight,
+      assigneesHighlight,
+    ) => {
+      const parts = []
+      let lastIndex = 0
+      let plainText = ''
+
+      // Combine all highlight ranges and sort them by their start index
+      const allHighlights = []
+      if (repeatHighlight) {
+        repeatHighlight.forEach(h =>
+          allHighlights.push({ ...h, type: 'repeat', priority: 60 }),
+        )
+      }
+      if (priorityHighlight) {
+        priorityHighlight.forEach(h =>
+          allHighlights.push({ ...h, type: 'priority', priority: 50 }),
+        )
+      }
+      if (pointsHighlight) {
+        pointsHighlight.forEach(h =>
+          allHighlights.push({ ...h, type: 'points', priority: 45 }),
+        )
+      }
+      if (assigneesHighlight) {
+        assigneesHighlight.forEach(h =>
+          allHighlights.push({ ...h, type: 'assignee', priority: 40 }),
+        )
+      }
+      if (labelsHighlight) {
+        labelsHighlight.forEach(h =>
+          allHighlights.push({ ...h, type: 'label', priority: 30 }),
+        )
+      }
+      if (dueDateHighlight) {
+        allHighlights.push({
+          ...dueDateHighlight,
+          type: 'dueDate',
+          priority: 20,
+        })
+      }
+
+      allHighlights.sort((a, b) => a.start - b.start)
+      const resolvedHighlights = []
+      for (let i = 0; i < allHighlights.length; i++) {
+        const current = allHighlights[i]
+        const previous = resolvedHighlights[resolvedHighlights.length - 1]
+
+        if (previous && current.start < previous.end) {
+          if (current.priority > previous.priority) {
+            resolvedHighlights.pop()
+            resolvedHighlights.push(current)
+          }
+        } else {
+          resolvedHighlights.push(current)
+        }
+      }
+
+      const seenHighlightKeys = new Set()
+      for (const highlight of resolvedHighlights) {
+        if (highlight.start > lastIndex) {
+          const textBefore = sentence.substring(lastIndex, highlight.start)
+          parts.push(textBefore)
+          plainText += textBefore
+        }
+
+        let className = ''
+        switch (highlight.type) {
+          case 'repeat':
+            className = 'highlight-repeat'
+            break
+          case 'priority':
+            className = 'highlight-priority'
+            break
+          case 'points':
+            className = 'highlight-points'
+            break
+          case 'assignee':
+            className = 'highlight-assignee'
+            break
+          case 'label':
+            className = 'highlight-label'
+            break
+          case 'dueDate':
+            className = 'highlight-date'
+            break
+          default:
+            break
+        }
+
+        const highlightedText = sentence.substring(
+          highlight.start,
+          highlight.end,
+        )
+        const highlightKey = `${highlight.type}:${highlightedText.toLowerCase()}`
+        const isNewHighlight = !prevHighlightKeysRef.current.has(highlightKey)
+        seenHighlightKeys.add(highlightKey)
+        parts.push(
+          <span
+            key={highlight.start}
+            className={`${className}${isNewHighlight ? ' highlight-appear' : ''}`}
+            style={{
+              textDecoration: 'underline',
+              textDecorationThickness: '2px',
+              textDecorationStyle: 'dashed',
+            }}
+          >
+            {highlightedText}
+          </span>,
+        )
+
+        lastIndex = highlight.end
+      }
+      prevHighlightKeysRef.current = seenHighlightKeys
+
+      if (lastIndex < sentence.length) {
+        const remainingText = sentence.substring(lastIndex)
+        parts.push(remainingText)
+        plainText += remainingText
+      }
+
+      return {
+        parts,
+        plainText,
+      }
+    },
+    [],
+  )
+
+  // Rebuilt only when the member list actually changes, so a query refetch
+  // with identical data doesn't re-trigger the parse effect below
+  const assigneesForParsing = useMemo(
+    () =>
+      assignableMembers.map(member => ({
+        userId: member.userId,
+        username:
+          member.username ||
+          member.displayName?.toLowerCase().replace(/\s+/g, ''),
+        displayName: member.displayName,
+        name: member.displayName,
+        id: member.userId,
+      })),
+    [assignableMembers],
+  )
+
+  const processText = useCallback(
+    sentence => {
+      const priority = parsePriority(sentence)
+      const pointsParsed = parsePoints(sentence)
+      const labels = parseLabels(sentence, userLabels || [])
+
+      const assigneesResult = parseAssignees(sentence, assigneesForParsing)
+      const repeat = parseRepeatV2(sentence)
+      const dueDateParsed = parseDueDate(sentence, chrono)
+
+      // Set all the parsed values
+      if (priority.result) setPriority(parseInt(priority.result, 10))
+      if (pointsParsed.result) setPoints(pointsParsed.result)
+      if (labels.result) {
+        // parseLabels only returns #mentions matched to an existing label
+        setLabelsV2(labels.result)
+      }
+
+      if (assigneesResult.isAnyone) {
+        // @Anyone was used - set empty assignees (anyone can do the task)
+        setIsAnyoneTask(true)
+        setAssignees([])
+        assigneesFromMentionRef.current = true
+      } else if (assigneesResult.result && assigneesResult.result.length > 0) {
+        setIsAnyoneTask(false)
+        const parsedAssignees = assigneesResult.result.map(assignee => ({
+          userId: assignee.userId,
+        }))
+        setAssignees(parsedAssignees)
+        assigneesFromMentionRef.current = true
+      } else if (assigneesFromMentionRef.current) {
+        // The @mention that set the current assignees was deleted. An empty
+        // selection is assigned to the current user when the task is created.
+        // Picker selections stay untouched.
+        assigneesFromMentionRef.current = false
+        setIsAnyoneTask(false)
+        setAssignees([])
+      }
+
+      if (repeat.result) {
+        setFrequency(repeat.result)
+      }
+
+      const syncDueDateStates = parsedDate => {
+        const m = moment(parsedDate)
+        const dateOnly = m.format('YYYY-MM-DD')
+        const timeOnly = m.format('HH:mm')
+        setDueDateOnly(dateOnly)
+        if (timeOnly !== '23:59') {
+          setUseCustomTime(true)
+          setDueTime(timeOnly)
+        } else {
+          setUseCustomTime(false)
+          setDueTime(null)
+        }
+      }
+
+      let dueDateHighlight = null
+      if (dueDateParsed.result) {
+        syncDueDateStates(dueDateParsed.result)
+        dueDateHighlight = dueDateParsed.highlight[0]
+      } else if (repeat.dueDate) {
+        syncDueDateStates(repeat.dueDate)
+      }
+
+      // Create the cleaned sentence by sequentially applying all cleanups.
+      // Each stage only needs a reparse when an earlier cleanup actually
+      // changed the sentence; otherwise the first-pass result (computed on the
+      // identical string) is reused as-is.
+      let cleanedSentence = sentence
+      if (priority.result) cleanedSentence = priority.cleanedSentence
+      if (pointsParsed.result) {
+        const pointsReparse =
+          cleanedSentence === sentence
+            ? pointsParsed
+            : parsePoints(cleanedSentence)
+        if (pointsReparse.result)
+          cleanedSentence = pointsReparse.cleanedSentence
+      }
+      if (labels.result) {
+        const labelsReparse =
+          cleanedSentence === sentence
+            ? labels
+            : parseLabels(cleanedSentence, userLabels || [])
+        if (labelsReparse.result)
+          cleanedSentence = labelsReparse.cleanedSentence
+      }
+      if (assigneesResult.result) {
+        const assigneesReparse =
+          cleanedSentence === sentence
+            ? assigneesResult
+            : parseAssignees(cleanedSentence, assigneesForParsing)
+        if (assigneesReparse.result)
+          cleanedSentence = assigneesReparse.cleanedSentence
+      }
+      if (repeat.result) {
+        const repeatReparse =
+          cleanedSentence === sentence ? repeat : parseRepeatV2(cleanedSentence)
+        if (repeatReparse.result)
+          cleanedSentence = repeatReparse.cleanedSentence
+      }
+      if (dueDateParsed.result) {
+        const dueDateReparse =
+          cleanedSentence === sentence
+            ? dueDateParsed
+            : parseDueDate(cleanedSentence, chrono)
+        if (dueDateReparse.result)
+          cleanedSentence = dueDateReparse.cleanedSentence
+      }
+
+      setTaskText(sentence)
+      setTaskTitle(cleanedSentence.trim())
+
+      // Generate highlights for rendering using original sentence positions
+      const { parts } = renderHighlightedSentence(
+        sentence,
+        repeat.highlight,
+        priority.highlight,
+        labels.highlight,
+        dueDateHighlight,
+        pointsParsed.highlight,
+        assigneesResult.highlight,
+      )
+
+      setRenderedParts({ text: sentence, parts })
+
+      const overrides = pendingVoiceOverridesRef.current
+      if (overrides) {
+        pendingVoiceOverridesRef.current = null
+        if ('priority' in overrides) setPriority(overrides.priority || 0)
+        if ('frequency' in overrides) setFrequency(overrides.frequency)
+        if ('labelIds' in overrides) setLabelsV2(overrides.labelIds || [])
+        if ('notificationMetadata' in overrides) {
+          setNotificationMetadata(
+            overrides.notificationMetadata || { templates: [] },
+          )
+        }
+        if ('assignees' in overrides || 'isAnyone' in overrides) {
+          setIsAnyoneTask(!!overrides.isAnyone)
+          setAssignees(overrides.assignees || [])
+          assigneesFromMentionRef.current = false
+        }
+        if ('dueDate' in overrides) {
+          if (overrides.dueDate) {
+            syncDueDateStates(overrides.dueDate)
+          } else {
+            setDueDateOnly(null)
+            setDueTime(null)
+            setUseCustomTime(false)
+          }
+        }
+      }
+    },
+    [userLabels, renderHighlightedSentence, assigneesForParsing],
+  )
+
+  useEffect(() => {
+    if (
+      !isModalOpen ||
+      userLabelsLoading ||
+      isCircleMembersLoading ||
+      !userProfile
+    ) {
+      return
+    }
+
+    // Debounced so fast typing doesn't run the full parse pipeline per
+    // keystroke; submitChore flushes a pending parse before creating.
+    parseTimerRef.current = setTimeout(() => {
+      parseTimerRef.current = null
+      processText(taskText)
+    }, PARSE_DEBOUNCE_MS)
+    return () => {
+      clearTimeout(parseTimerRef.current)
+      parseTimerRef.current = null
+    }
+  }, [
+    taskText,
+    userLabelsLoading,
+    isCircleMembersLoading,
+    isModalOpen,
+    userProfile,
+    processText,
+  ])
+
+  const handleDueDateChange = e => {
+    setDueDateOnly(e.target.value || null)
+  }
+
+  const handleDueTimeChange = e => {
+    const timeValue = e.target.value
+    setDueTime(timeValue || null)
+    // A time typed straight into the field is itself the request for one.
+    if (timeValue) setUseCustomTime(true)
+  }
+
+  const handleUseCustomTimeChange = checked => {
+    setUseCustomTime(checked)
+    // Turning the toggle on needs something on the clock to show. The picker
+    // sends the real time right after this, and wins.
+    if (checked) {
+      setDueTime(prev => prev || '18:00')
+    } else {
+      setDueTime(null)
+    }
+  }
+
+  // Plain Enter is the fast path for entering several tasks in a row: create
+  // this one and leave the form open and blank for the next. Cmd+Enter (the
+  // window-level handler below) and the footer's Create button still close
+  // the modal.
+  const handleEnterPressed = () => {
+    submitChore(true)
+  }
+
+  // The scan keeps its source image when asked: upload it against the draft so
+  // the server promotes it onto the chore the same way manual uploads are.
+  const attachScannedImage = async imageSource => {
+    // Creating the chore promotes whatever draft attachments exist at that
+    // moment, so Create waits on this upload rather than orphaning it.
+    setIsAttachingScan(true)
+    try {
+      const file = await imageSourceToFile(
+        imageSource,
+        `scan-${Date.now()}.jpg`,
+      )
+      if (!file) return
+      const uploaded = await uploadFile(file)
+      if (!uploaded) return
+      setAttachments(prev => [
+        ...prev,
+        { url: uploaded.url, path: uploaded.path, name: uploaded.fileName },
+      ])
+      return uploaded
+    } finally {
+      setIsAttachingScan(false)
+    }
+  }
+
+  const dismissShareAnalysis = useCallback(() => {
+    shareAnalysisRunRef.current += 1
+    setShareAnalysis({
+      status: 'idle',
+      suggestion: null,
+      source: null,
+      hasAttachment: false,
+      attachmentPath: null,
+      analysisId: null,
+    })
+  }, [])
+
+  const analyzeImageInBackground = useCallback(
+    ({ file, hasAttachment, imageSource, source }) => {
+      const analysisRun = ++shareAnalysisRunRef.current
+      setShareAnalysis({
+        status: 'processing',
+        suggestion: null,
+        source,
+        hasAttachment,
+        attachmentPath: null,
+        analysisId: analysisRun,
+      })
+
+      void (async () => {
+        try {
+          const imageUrl = file ? await fileToDataUrl(file) : imageSource
+          const result = await extractTaskFromImage(imageUrl)
+          if (shareAnalysisRunRef.current !== analysisRun) return
+          setShareAnalysis(current => ({
+            ...current,
+            status: result.status === 'found' ? 'found' : 'empty',
+            suggestion: result.status === 'found' ? result.task : null,
+          }))
+        } catch (error) {
+          console.error('[TaskImage] failed to analyze image:', error)
+          if (shareAnalysisRunRef.current === analysisRun) {
+            setShareAnalysis(current => ({
+              ...current,
+              status: 'error',
+              suggestion: null,
+            }))
+          }
+        }
+      })()
+
+      return analysisRun
+    },
+    [],
+  )
+
+  // Empty/error notices are informational; leave them long enough to be read,
+  // then get out of the user's way. A found suggestion remains until decided.
+  useEffect(() => {
+    if (!['empty', 'error'].includes(shareAnalysis.status)) return undefined
+    const timer = setTimeout(dismissShareAnalysis, 5000)
+    return () => clearTimeout(timer)
+  }, [shareAnalysis.status, dismissShareAnalysis])
+
+  const applyShareSuggestion = async (removeAttachment = false) => {
+    const suggestion = shareAnalysis.suggestion
+    if (!suggestion) return
+
+    if (removeAttachment && shareAnalysis.attachmentPath) {
+      setRemovingSuggestedAttachment(true)
+      try {
+        await DeleteDraftAttachment(shareAnalysis.attachmentPath)
+        setAttachments(current =>
+          current.filter(item => item.path !== shareAnalysis.attachmentPath),
+        )
+      } catch (error) {
+        console.error('[TaskImage] failed to remove attachment:', error)
+        return
+      } finally {
+        setRemovingSuggestedAttachment(false)
+      }
+    }
+
+    if (suggestion.taskName) processText(suggestion.taskName)
+    if (suggestion.description) {
+      setDescription(suggestion.description)
+      setHasDescription(true)
+    }
+    if (suggestion.dueDate) {
+      const date = moment(new Date(suggestion.dueDate))
+      if (date.isValid()) {
+        setDueDateOnly(date.format('YYYY-MM-DD'))
+        setDueTime(null)
+        setUseCustomTime(false)
+      }
+    }
+    taskSourceRef.current = shareAnalysis.source || 'scan'
+    dismissShareAnalysis()
+  }
+
+  // A native share opens directly into this modal. Files are uploaded against
+  // the same draft as picker attachments. Analysis of the first image starts
+  // in parallel, while the normal task form remains available.
+  const appliedInitialShareRef = useRef(null)
+  useEffect(() => {
+    if (!isModalOpen) {
+      appliedInitialShareRef.current = null
+      return
+    }
+    if (!initialShare || appliedInitialShareRef.current === initialShare.id) {
+      return
+    }
+    appliedInitialShareRef.current = initialShare.id
+    taskSourceRef.current = 'share'
+
+    const applyShare = async () => {
+      const items = initialShare.items || []
+      const textItem = items.find(item => item.type === 'text/plain')
+      const sharedText = textItem?.url || textItem?.title || ''
+      const sharedSubject =
+        textItem?.title && textItem.title !== sharedText ? textItem.title : null
+      const attachmentItems = items.filter(item =>
+        item.type === 'text/plain'
+          ? item.url || item.description || item.title
+          : item.url,
+      )
+
+      // A shared file's title is normally just its filename. Leave the task
+      // title empty rather than presenting that implementation detail as a
+      // suggested task name.
+      const initialTitle = sharedSubject || sharedText || ''
+      if (initialTitle) processText(initialTitle)
+      if (sharedSubject && sharedText) {
+        setDescription(sharedText)
+        setHasDescription(true)
+      }
+
+      setIsAttachingScan(attachmentItems.length > 0)
+      let analyzedFile = null
+      let analysisRun = null
+
+      try {
+        for (const item of attachmentItems) {
+          try {
+            const file = await sharedItemToFile(item)
+            if (!file) continue
+            if (
+              !analyzedFile &&
+              file.type.startsWith('image/') &&
+              (await localAIService.isAvailable())
+            ) {
+              analyzedFile = file
+              // OCR/AI and attachment uploads proceed together. The returned
+              // run id associates the eventual upload path with this image.
+              analysisRun = analyzeImageInBackground({
+                file,
+                hasAttachment: true,
+                source: 'share',
+              })
+            }
+            const uploaded = await uploadFile(file)
+            if (!uploaded && file === analyzedFile) {
+              setShareAnalysis(current =>
+                current.analysisId === analysisRun
+                  ? { ...current, hasAttachment: false }
+                  : current,
+              )
+            }
+            if (uploaded) {
+              setAttachments(current => [
+                ...current,
+                {
+                  name: uploaded.fileName,
+                  path: uploaded.path,
+                  url: uploaded.url,
+                },
+              ])
+              if (file === analyzedFile) {
+                setShareAnalysis(current =>
+                  current.analysisId === analysisRun
+                    ? { ...current, attachmentPath: uploaded.path }
+                    : current,
+                )
+              }
+            }
+          } catch (error) {
+            console.error('[ShareTarget] failed to import shared file:', error)
+          }
+        }
+      } finally {
+        setIsAttachingScan(false)
+      }
+    }
+
+    void applyShare()
+  }, [
+    initialShare,
+    isModalOpen,
+    processText,
+    uploadFile,
+    analyzeImageInBackground,
+  ])
+
+  const handleBackgroundScanCaptured = ({ image, keepImage }) => {
+    taskSourceRef.current = 'scan'
+    const analysisRun = analyzeImageInBackground({
+      imageSource: image,
+      hasAttachment: keepImage,
+      source: 'scan',
+    })
+    if (keepImage) {
+      void attachScannedImage(image).then(uploaded => {
+        setShareAnalysis(current => {
+          if (current.analysisId !== analysisRun) return current
+          return uploaded
+            ? { ...current, attachmentPath: uploaded.path }
+            : { ...current, hasAttachment: false }
+        })
+      })
+    }
+  }
+
+  const handleTaskExtracted = ({
+    attachmentImage,
+    description: extractedDesc,
+    dueDate: extractedDue,
+    taskName,
+  }) => {
+    if (!scanImageAlreadyAttached) taskSourceRef.current = 'scan'
+    if (attachmentImage) {
+      attachScannedImage(attachmentImage)
+    }
+    if (taskName) {
+      processText(taskName)
+    }
+    if (extractedDesc) {
+      setDescription(extractedDesc)
+      setHasDescription(true)
+    }
+    if (extractedDue) {
+      const m = moment(new Date(extractedDue))
+      if (m.isValid()) {
+        // The scan gives a date, never a time — end of day, as before.
+        setDueDateOnly(m.format('YYYY-MM-DD'))
+        setDueTime(null)
+        setUseCustomTime(false)
+      }
+    }
+  }
+
+  // Single voice-captured task: land it in the smart input so the user
+  // reviews it with the normal pickers before creating.
+  const handleVoiceSingle = (text, overrides = {}) => {
+    setShowVoice(false)
+    taskSourceRef.current = 'voice'
+    if (Object.keys(overrides).length > 0) {
+      pendingVoiceOverridesRef.current = overrides
+    }
+    setTaskText(text)
+  }
+
+  // Multiple voice-captured tasks: they were reviewed as cards in the panel,
+  // so create them all directly.
+  const handleVoiceCreateMany = async parsedTasks => {
+    setCreatingVoiceTasks(true)
+    const notificationTemplates = getDefaultNotification()
+    for (const parsed of parsedTasks) {
+      const chore = buildChorePayload(parsed, {
+        userProfile,
+        projectId,
+        notificationTemplates,
+      })
+      chore.source = 'voice'
+      try {
+        const result = await createChoreMutation.mutateAsync(chore)
+        if (result?._pendingCreate) {
+          onChoreUpdate(result)
+        } else {
+          onChoreUpdate({
+            ...chore,
+            ...result,
+            id: result?.id,
+            nextDueDate: chore.dueDate,
+          })
+        }
+      } catch (error) {
+        console.error('Error creating voice task:', error)
+      }
+    }
+    setCreatingVoiceTasks(false)
+    handleCloseModal(false)
+  }
+
+  // Footer confirm while the voice panel is open: one task lands in the smart
+  // input for review, several are created straight away.
+  const handleVoiceConfirm = () => {
+    const { segments } = voiceState
+    if (segments.length === 1) {
+      handleVoiceSingle(segments[0].text, segments[0].overrides || {})
+    } else if (segments.length > 1) {
+      // Parse only at confirm time — the cards already parse for their own
+      // display, so there's no need to keep a parsed copy in modal state
+      const parseCtx = {
+        userLabels: voiceLabels,
+        members: voiceMembers,
+        currentUserId: userProfile?.id,
+      }
+      handleVoiceCreateMany(
+        segments.map(segment => ({
+          ...parseVoiceTask(segment.text, parseCtx),
+          ...(segment.overrides || {}),
+        })),
+      )
+    }
+  }
+
+  // Clears everything a single task entry filled in, leaving the modal (and
+  // the selected project) as-is — used both on close and by "create & add
+  // another" to hand back a blank form without losing the project context.
+  const resetFormFields = () => {
+    setTaskText('')
+    setTaskTitle('')
+    setFrequency(null)
+    setPriority(0)
+    setPoints(-1)
+    setIsAnyoneTask(false)
+    setHasDescription(false)
+    setDescription(null)
+    setSubTasks(null)
+    setHasSubTasks(false)
+    setLabelsV2([])
+    setAssignees([])
+    assigneesFromMentionRef.current = false
+    // Dropped here too or nothing would animate on the next task's parse
+    prevHighlightKeysRef.current = new Set()
+    setDeadlineOffset(-1)
+    setRequireApproval(false)
+    setCompletionWindow(-1)
+    setAssignStrategy('keep_last_assigned')
+    setIsPrivate(false)
+    setShowAdvanced(false)
+    setDueDateOnly(null)
+    setDueTime(null)
+    setUseCustomTime(false)
+    setAttachments([])
+    setDraftId(generateUUID())
+    shareAnalysisRunRef.current += 1
+    setShareAnalysis({
+      status: 'idle',
+      suggestion: null,
+      source: null,
+      hasAttachment: false,
+      attachmentPath: null,
+      analysisId: null,
+    })
+    setRemovingSuggestedAttachment(false)
+    taskSourceRef.current = 'quick_add'
+  }
+
+  const handleCloseModal = forceRefetch => {
+    onClose(forceRefetch)
+    setShowScan(false)
+    setShowVoice(false)
+    setVoiceState({ segments: [], isListening: false })
+    setScanState({ phase: 'idle', primaryAction: null })
+    setCreatingVoiceTasks(false)
+    setIsAttachingScan(false)
+    setScanImageAlreadyAttached(false)
+    resetFormFields()
+    setProjectId(getInitialProject())
+    setContinuousMode(false)
+  }
+
+  const createChore = (andContinue = false) => {
+    // A scanned attachment still uploading would be orphaned by the create
+    if (isAttachingScan) return
+
+    // Handle different assignee scenarios
+    let finalAssignees = assignees
+    let finalAssignedTo = null
+    let finalAssignStrategy = assignStrategy
+
+    if (isAnyoneTask) {
+      finalAssignees = []
+      finalAssignedTo = null
+      finalAssignStrategy = 'no_assignee'
+    } else if (assignees.length === 0) {
+      finalAssignees = [{ userId: userProfile?.id }]
+      finalAssignedTo = userProfile?.id
+      finalAssignStrategy = assignStrategy
+    } else {
+      finalAssignedTo = assignees[0].userId
+      finalAssignStrategy = assignStrategy
+    }
+
+    // "always" chores never have a due date — backend keeps nextDueDate null
+    // and never archives them on completion (see RepeatSection.jsx for the
+    // full-edit-form equivalent).
+    const isAlwaysAvailable = frequency?.frequencyType === 'always'
+
+    const chore = {
+      name: taskTitle,
+      description: description,
+      assignees: finalAssignees,
+      dueDate: isAlwaysAvailable
+        ? null
+        : dueDate
+          ? new Date(dueDate).toISOString()
+          : null,
+      assignedTo: finalAssignedTo,
+      assignStrategy: finalAssignStrategy,
+      isRolling: false,
+      labelsV2: labelsV2,
+      priority: priority ? Number(priority) : 0,
+      points: points > -1 ? points : null,
+      deadlineOffset: deadlineOffset < 0 ? null : deadlineOffset,
+      completionWindow:
+        completionWindow < 0 || !dueDate || isAlwaysAvailable
+          ? null
+          : completionWindow,
+      requireApproval: requireApproval,
+      isPrivate: isPrivate,
+      status: 0,
+      frequencyType: 'once',
+      frequencyMetadata: {},
+      notification: false,
+      notificationMetadata: {},
+      subTasks: subTasks?.length > 0 ? subTasks : null,
+      projectId: projectId === 'default' ? null : projectId,
+      draftId: draftId,
+      source: taskSourceRef.current,
+    }
+
+    // Every plan gets reminders; the free plan is capped at the on-due one.
+    // Without the flag the backend never schedules them. "always" chores are
+    // rejected with forbidden_with_trigger_frequency if notification is true,
+    // same rule as trigger frequencies.
+    const planReminders = sanitizeRemindersForPlan(
+      notificationMetadata?.templates,
+      isPlusAccount(userProfile),
+    )
+    const hasReminders = planReminders.length > 0 && !isAlwaysAvailable
+
+    if (frequency) {
+      chore.frequencyType = frequency.frequencyType
+      chore.frequencyMetadata = frequency.frequencyMetadata
+      chore.frequency = frequency.frequency
+    }
+    if (dueDate && !isAlwaysAvailable) {
+      // Use RFC3339/ISO-8601 format expected by backend. The backend only
+      // derives NextDueDate from what's sent on create (handler.go never
+      // computes it from frequencyType), so this must be sent whether or
+      // not the task also repeats — otherwise a recurring task created with
+      // a due date lands with nextDueDate: null.
+      chore.nextDueDate = new Date(dueDate).toISOString()
+    }
+    if (hasReminders && (frequency || dueDate)) {
+      chore.notification = true
+      chore.notificationMetadata = {
+        ...notificationMetadata,
+        templates: planReminders,
+      }
+    }
+
+    createChoreMutation
+      .mutateAsync(chore)
+      .then(result => {
+        const choreData = result
+        if (choreData?._pendingCreate) {
+          // Offline: task queued, add temp chore to UI immediately
+          onChoreUpdate(choreData)
+        } else {
+          // Online: choreData is the created chore object returned by the mutation
+          onChoreUpdate({
+            ...chore,
+            ...choreData,
+            id: choreData?.id,
+            nextDueDate: chore.dueDate,
+          })
+        }
+      })
+      .catch(error => {
+        console.error('Error creating chore:', error)
+      })
+
+    // The create fires above without waiting on the network, so the next
+    // blank entry (or the closed modal) shows up immediately either way.
+    if (andContinue) {
+      resetFormFields()
+    } else {
+      handleCloseModal(false)
+    }
+  }
+
+  // All submit paths (Enter, Cmd+Enter, footer button) go through here: a
+  // debounce may still be holding the parse of the latest text, and creating
+  // from pre-parse state would drop the tail of what the user typed.
+  const submitChore = (andContinue = false) => {
+    if (parseTimerRef.current) {
+      clearTimeout(parseTimerRef.current)
+      parseTimerRef.current = null
+      flushSync(() => processText(taskText))
+    }
+    // Read through latestRef: after the flush, this render's createChore
+    // closure is stale
+    latestRef.current.createChore(andContinue)
+  }
+
+  latestRef.current = {
+    isModalOpen,
+    isShortcutScopeActive,
+    hasDescription,
+    dueDate,
+    createChore,
+    submitChore,
+    handleCloseModal,
+  }
+
+  if (isCircleMembersLoading || isProjectsLoading) {
+    return <></>
+  }
+
+  return (
+    <>
+      <ResponsiveModal
+        open={isModalOpen}
+        onClose={handleCloseModal}
+        size='lg'
+        fullWidth={true}
+        title={t('addTask.title')}
+        footer={
+          <ModalActions>
+            {!showScan && !showVoice && projects?.length >= 1 && (
+              <Dropdown>
+                <MenuButton
+                  variant='plain'
+                  color='neutral'
+                  size='sm'
+                  startDecorator={
+                    <SelectedProjectIcon
+                      sx={{ fontSize: 18, color: selectedProject.color }}
+                    />
+                  }
+                  endDecorator={<KeyboardArrowDown sx={{ fontSize: 16 }} />}
+                  sx={{
+                    mr: 'auto',
+                    color: 'text.secondary',
+                    fontWeight: 'normal',
+                  }}
+                >
+                  {selectedProject.id === 'default'
+                    ? t('addTask.defaultProject')
+                    : selectedProject.name}
+                </MenuButton>
+                <Menu
+                  placement='top-start'
+                  sx={{
+                    minWidth: 200,
+                    zIndex: 'calc(var(--joy-zIndex-modal) + 1)',
+                  }}
+                >
+                  {[DEFAULT_PROJECT, ...projects].map(project => {
+                    const ProjectIcon = getIconComponent(project.icon)
+                    return (
+                      <MenuItem
+                        key={project.id}
+                        selected={projectId === project.id}
+                        onClick={() => setProjectId(project.id)}
+                      >
+                        <ListItemDecorator>
+                          <ProjectIcon
+                            sx={{ fontSize: 18, color: project.color }}
+                          />
+                        </ListItemDecorator>
+                        {project.id === 'default'
+                          ? t('addTask.defaultProject')
+                          : project.name}
+                        {project.isPrivate && (
+                          <Lock
+                            sx={{
+                              fontSize: 14,
+                              ml: 0.5,
+                              verticalAlign: 'text-bottom',
+                            }}
+                          />
+                        )}
+                      </MenuItem>
+                    )
+                  })}
+                </Menu>
+              </Dropdown>
+            )}
+            <Button
+              variant='outlined'
+              color='neutral'
+              onClick={handleCloseModal}
+            >
+              {t('common:cancel')}
+              {showKeyboardShortcuts && (
+                <KeyboardShortcutHint
+                  shortcut='Esc'
+                  sx={{ ml: 1 }}
+                  withCtrl={false}
+                />
+              )}
+            </Button>
+            {showVoice && (
+              <Button
+                variant='solid'
+                color='primary'
+                loading={creatingVoiceTasks}
+                disabled={
+                  voiceState.segments.length === 0 || voiceState.isListening
+                }
+                onClick={handleVoiceConfirm}
+              >
+                {creatingVoiceTasks
+                  ? t('addTask.creating')
+                  : voiceState.segments.length > 1
+                    ? t('addTask.createCount', {
+                        count: voiceState.segments.length,
+                      })
+                    : t('addTask.useTask')}
+              </Button>
+            )}
+            {showScan && scanState.primaryAction && (
+              <Button
+                variant='solid'
+                color='primary'
+                startDecorator={scanState.primaryAction.icon}
+                onClick={scanState.primaryAction.onClick}
+              >
+                {scanState.primaryAction.label}
+              </Button>
+            )}
+            {showScan && scanState.phase === 'processing' && (
+              <Button variant='solid' color='primary' loading disabled>
+                {t('addTask.processing')}
+              </Button>
+            )}
+            {!showScan && !showVoice && (
+              <Box sx={{ display: 'flex' }}>
+                <Button
+                  variant='solid'
+                  color='primary'
+                  loading={isAttachingScan}
+                  disabled={!taskTitle.trim() || isAttachingScan}
+                  onClick={() => submitChore(continuousMode)}
+                  sx={{
+                    borderTopRightRadius: 0,
+                    borderBottomRightRadius: 0,
+                  }}
+                >
+                  {continuousMode
+                    ? t('addTask.createAnother')
+                    : t('addTask.create')}
+                  {showKeyboardShortcuts && (
+                    <KeyboardShortcutHint shortcut='Enter' sx={{ ml: 1 }} />
+                  )}
+                </Button>
+                <Dropdown>
+                  <MenuButton
+                    slots={{ root: Button }}
+                    slotProps={{
+                      root: {
+                        variant: 'solid',
+                        color: 'primary',
+                        disabled: !taskTitle.trim() || isAttachingScan,
+                      },
+                    }}
+                    sx={{
+                      borderTopLeftRadius: 0,
+                      borderBottomLeftRadius: 0,
+                      borderLeft: '1px solid rgba(255, 255, 255, 0.4)',
+                      minWidth: 0,
+                      px: 0.75,
+                    }}
+                  >
+                    <KeyboardArrowDown sx={{ fontSize: 18 }} />
+                  </MenuButton>
+                  <Menu
+                    placement='top-end'
+                    sx={{ zIndex: 'calc(var(--joy-zIndex-modal) + 1)' }}
+                  >
+                    {continuousMode ? (
+                      <MenuItem
+                        onClick={() => {
+                          setContinuousMode(false)
+                          submitChore(false)
+                        }}
+                      >
+                        {t('addTask.createAndClose')}
+                      </MenuItem>
+                    ) : (
+                      <MenuItem
+                        onClick={() => {
+                          setContinuousMode(true)
+                          submitChore(true)
+                        }}
+                      >
+                        {t('addTask.createAndAddAnother')}
+                        {showKeyboardShortcuts && (
+                          <KeyboardShortcutHint
+                            shortcut='Enter'
+                            withCmd={false}
+                            sx={{ ml: 1 }}
+                          />
+                        )}
+                      </MenuItem>
+                    )}
+                  </Menu>
+                </Dropdown>
+              </Box>
+            )}
+          </ModalActions>
+        }
+      >
+        {!showScan && !showVoice && (
+          <>
+            {shareAnalysis.status !== 'idle' && (
+              <Alert
+                variant='soft'
+                color={
+                  shareAnalysis.status === 'found'
+                    ? 'success'
+                    : shareAnalysis.status === 'error'
+                      ? 'warning'
+                      : 'primary'
+                }
+                startDecorator={
+                  shareAnalysis.status === 'processing' ? (
+                    <CircularProgress size='sm' />
+                  ) : (
+                    <AutoAwesome />
+                  )
+                }
+                endDecorator={
+                  <IconButton
+                    size='sm'
+                    variant='plain'
+                    color='neutral'
+                    aria-label={t('addTask.dismissAnalysis')}
+                    onClick={dismissShareAnalysis}
+                  >
+                    <Close />
+                  </IconButton>
+                }
+                sx={{ mt: 1, alignItems: 'flex-start' }}
+              >
+                {shareAnalysis.status === 'processing' && (
+                  <Box>
+                    <Typography level='title-sm'>
+                      {t('addTask.findingDetails')}
+                    </Typography>
+                    <Typography level='body-sm'>
+                      {t('addTask.findingDetailsHint')}
+                    </Typography>
+                  </Box>
+                )}
+                {shareAnalysis.status === 'found' && (
+                  <Box sx={{ width: '100%' }}>
+                    <Typography level='title-sm'>
+                      {t('addTask.detailsFound')}
+                    </Typography>
+                    <Box sx={{ mt: 0.75 }}>
+                      <Typography level='body-sm' sx={{ fontWeight: 'lg' }}>
+                        {shareAnalysis.suggestion?.taskName}
+                      </Typography>
+                      {shareAnalysis.suggestion?.dueDate && (
+                        <Typography level='body-xs' sx={{ mt: 0.25 }}>
+                          {t('addTask.suggestedDue', {
+                            date: moment(
+                              shareAnalysis.suggestion.dueDate,
+                            ).format('LL'),
+                          })}
+                        </Typography>
+                      )}
+                      {shareAnalysis.suggestion?.description && (
+                        <Typography
+                          level='body-xs'
+                          sx={{
+                            mt: 0.25,
+                            display: '-webkit-box',
+                            WebkitLineClamp: 2,
+                            WebkitBoxOrient: 'vertical',
+                            overflow: 'hidden',
+                          }}
+                        >
+                          {shareAnalysis.suggestion.description}
+                        </Typography>
+                      )}
+                    </Box>
+                    <Box
+                      sx={{ display: 'flex', gap: 1, mt: 1, flexWrap: 'wrap' }}
+                    >
+                      <Button
+                        size='sm'
+                        variant='solid'
+                        loading={removingSuggestedAttachment}
+                        disabled={
+                          shareAnalysis.hasAttachment &&
+                          !shareAnalysis.attachmentPath
+                        }
+                        onClick={() =>
+                          void applyShareSuggestion(shareAnalysis.hasAttachment)
+                        }
+                        sx={{ borderRadius: '128px', px: 1.5 }}
+                      >
+                        {t('addTask.useSuggestion')}
+                      </Button>
+                      {shareAnalysis.hasAttachment && (
+                        <Button
+                          size='sm'
+                          variant='outlined'
+                          color='neutral'
+                          onClick={() => void applyShareSuggestion(false)}
+                          sx={{ borderRadius: '128px', px: 1.5 }}
+                        >
+                          {t('addTask.useAndKeepAttachment')}
+                        </Button>
+                      )}
+                      <Button
+                        size='sm'
+                        variant='plain'
+                        color='neutral'
+                        onClick={dismissShareAnalysis}
+                        sx={{ borderRadius: '128px', px: 1.5 }}
+                      >
+                        {t('addTask.dismissSuggestion')}
+                      </Button>
+                    </Box>
+                  </Box>
+                )}
+                {shareAnalysis.status === 'empty' && (
+                  <Box>
+                    <Typography level='title-sm'>
+                      {t('addTask.noDetailsFound')}
+                    </Typography>
+                    <Typography level='body-sm'>
+                      {shareAnalysis.hasAttachment
+                        ? t('addTask.attachmentStillAdded')
+                        : t('addTask.continueManually')}
+                    </Typography>
+                  </Box>
+                )}
+                {shareAnalysis.status === 'error' && (
+                  <Box>
+                    <Typography level='title-sm'>
+                      {t('addTask.analysisFailed')}
+                    </Typography>
+                    <Typography level='body-sm'>
+                      {shareAnalysis.hasAttachment
+                        ? t('addTask.attachmentStillAdded')
+                        : t('addTask.continueManually')}
+                    </Typography>
+                  </Box>
+                )}
+              </Alert>
+            )}
+            <Box sx={{ mt: 1 }}>
+              {/* <Box
+                sx={{
+                  display: 'flex',
+                  flexDirection: 'row',
+                  alignItems: 'center',
+                }}
+              >
+                <Typography level='body-sm'>Task in a sentence:</Typography>
+                <LearnMoreButton
+                  content={
+                    <>
+                      <Typography level='body-sm' sx={{ mb: 1 }}>
+                        This feature lets you create a task simply by typing a
+                        sentence. It attempt parses the sentence to identify the
+                        task&apos;s due date, priority, and frequency.
+                      </Typography>
+
+                      <Typography
+                        level='body-sm'
+                        sx={{ fontWeight: 'bold', mt: 2 }}
+                      >
+                        Examples:
+                      </Typography>
+
+                      <Typography
+                        level='body-sm'
+                        component='ul'
+                        sx={{ pl: 2, mt: 1, listStyle: 'disc' }}
+                      >
+                        <li>
+                          <strong>Priority:</strong>For highest priority any of
+                          the following keyword <em>P1</em>, <em>Urgent</em>,{' '}
+                          <em>Important</em>, or <em>ASAP</em>. For lower
+                          priorities, use <em>P2</em>, <em>P3</em>, or{' '}
+                          <em>P4</em>.
+                        </li>
+                        <li>
+                          <strong>Due date:</strong> Specify dates with phrases
+                          like <em>tomorrow</em>, <em>next week</em>,{' '}
+                          <em>Monday</em>, or <em>August 1st at 12pm</em>.
+                        </li>
+                        <li>
+                          <strong>Frequency:</strong> Set recurring tasks with
+                          terms like <em>daily</em>, <em>weekly</em>,{' '}
+                          <em>monthly</em>, <em>yearly</em>, or patterns such as{' '}
+                          <em>every Tuesday and Thursday</em>.
+                        </li>
+                      </Typography>
+                    </>
+                  }
+                />
+              </Box> */}
+
+              <SmartTaskTitleInput
+                autoFocus
+                value={taskText}
+                isNativeScanner={isNativeScanner}
+                onScanClick={
+                  llmAvailable
+                    ? () => {
+                        setScanAutoCapture(true)
+                        setShowScan(true)
+                      }
+                    : undefined
+                }
+                onPhotoSelected={
+                  llmAvailable
+                    ? dataUrl => {
+                        setScanAutoCapture(false)
+                        setPendingPhotoUrl(dataUrl)
+                        setShowScan(true)
+                      }
+                    : undefined
+                }
+                onVoiceClick={
+                  voiceAvailable ? () => setShowVoice(true) : undefined
+                }
+                placeholder={t('addTask.taskPlaceholder')}
+                onChange={text => {
+                  setTaskText(text)
+                  if (!text) setTaskTitle('')
+                }}
+                customRenderer={displayedParts}
+                onEnterPressed={handleEnterPressed}
+                onShiftEnterPressed={() => {
+                  if (!hasDescription) {
+                    setHasDescription(true)
+                  }
+                  setTimeout(() => richTextEditorRef.current?.focus(), 50)
+                }}
+                suggestions={smartInputSuggestions}
+              />
+            </Box>
+
+            <Box
+              sx={{
+                paddingTop: 2,
+                paddingBottom: 1,
+                display: 'flex',
+                flexDirection: 'row',
+                gap: 1.5,
+                overflowX: 'auto',
+                '&::-webkit-scrollbar': { display: 'none' },
+                flexWrap: isMobile ? 'nowrap' : 'wrap',
+              }}
+            >
+              <DueDatePickerField
+                emptyDisplay={pickerEmptyDisplay}
+                dueDateOnly={dueDateOnly}
+                dueTime={dueTime}
+                useCustomTime={useCustomTime}
+                onDueDateChange={handleDueDateChange}
+                onDueTimeChange={handleDueTimeChange}
+                onUseCustomTimeChange={handleUseCustomTimeChange}
+                onClear={() => {
+                  setDueDateOnly(null)
+                  setDueTime(null)
+                  setUseCustomTime(false)
+                }}
+              />
+              <RepeatPickerField
+                emptyDisplay={pickerEmptyDisplay}
+                value={frequency}
+                onChange={newFrequency => {
+                  setFrequency(newFrequency)
+                  // "always" tasks never have a due date — clear whatever
+                  // was picked so the chips don't show a contradictory state
+                  if (newFrequency?.frequencyType === 'always') {
+                    setDueDateOnly(null)
+                    setDueTime(null)
+                    setUseCustomTime(false)
+                  }
+                }}
+                onClear={() => setFrequency(null)}
+              />
+              <PriorityPickerField
+                value={priority}
+                onChange={setPriority}
+                onClear={() => setPriority(0)}
+                emptyDisplay={pickerEmptyDisplay}
+                priorityColors={PRIORITY_COLORS}
+                priorityLabels={PRIORITY_LABELS}
+              />
+              <AssigneePickerField
+                emptyDisplay={pickerEmptyDisplay}
+                values={assignees.map(a => a.userId)}
+                isAnyone={isAnyoneTask}
+                onChange={userIds => {
+                  if (userIds.includes('anyone')) {
+                    setIsAnyoneTask(true)
+                    setAssignees([])
+                  } else {
+                    setIsAnyoneTask(false)
+                    setAssignees(userIds.map(userId => ({ userId })))
+                  }
+                }}
+                onClear={() => {
+                  setIsAnyoneTask(false)
+                  setAssignees([])
+                }}
+                members={assignableMembers}
+              />
+              <LabelsPickerField
+                emptyDisplay={pickerEmptyDisplay}
+                values={(labelsV2 || []).map(label => label.id)}
+                onChange={ids =>
+                  setLabelsV2(
+                    (userLabels || []).filter(label => ids.includes(label.id)),
+                  )
+                }
+                onClear={() => setLabelsV2([])}
+                labels={userLabels || []}
+              />
+              <AttachmentPickerField
+                attachments={attachments}
+                onChange={setAttachments}
+                onClear={() => setAttachments([])}
+                emptyDisplay={pickerEmptyDisplay}
+                entityType='chore_attachment_draft'
+                draftId={draftId}
+              />
+              <NotificationPickerField
+                value={notificationMetadata}
+                onChange={setNotificationMetadata}
+                onClear={() => setNotificationMetadata({ templates: [] })}
+                emptyDisplay={pickerEmptyDisplay}
+              />
+            </Box>
+
+            <Box
+              sx={{
+                mt: 1,
+                display: 'flex',
+                flexDirection: 'row',
+                gap: 1.5,
+                flexWrap: 'wrap',
+                alignItems: 'center',
+              }}
+            >
+              {!hasDescription && (
+                <Button
+                  size='sm'
+                  variant='outlined'
+                  color='neutral'
+                  onClick={() => setHasDescription(true)}
+                  endDecorator={
+                    showKeyboardShortcuts && (
+                      <KeyboardShortcutHint shortcut='E' />
+                    )
+                  }
+                  sx={{
+                    borderRadius: '128px',
+                    minHeight: 40,
+                    px: 1.25,
+                    gap: 1,
+                    transition: 'all 0.25s ease-in-out',
+                  }}
+                >
+                  <Add sx={{ fontSize: 20 }} />
+                  <Typography level='body-sm'>
+                    {t('addTask.descriptionChip')}
+                  </Typography>
+                </Button>
+              )}
+              {!hasSubTasks && (
+                <Button
+                  size='sm'
+                  variant='outlined'
+                  color='neutral'
+                  onClick={() => setHasSubTasks(true)}
+                  endDecorator={
+                    showKeyboardShortcuts && (
+                      <KeyboardShortcutHint shortcut='J' />
+                    )
+                  }
+                  sx={{
+                    borderRadius: '128px',
+                    minHeight: 40,
+                    px: 1.25,
+                    gap: 1,
+                    transition: 'all 0.25s ease-in-out',
+                  }}
+                >
+                  <Add sx={{ fontSize: 20 }} />
+                  <Typography level='body-sm'>
+                    {t('addTask.subtasksChip')}
+                  </Typography>
+                </Button>
+              )}
+              <AdvancedOptionsTrigger
+                open={showAdvanced}
+                onToggle={() => setShowAdvanced(v => !v)}
+                activeCount={
+                  [
+                    points > -1,
+                    requireApproval,
+                    completionWindow > -1,
+                    deadlineOffset > -1,
+                  ].filter(Boolean).length
+                }
+                emptyDisplay={pickerEmptyDisplay}
+              />
+            </Box>
+
+            <AdvancedOptionsSection
+              open={showAdvanced}
+              points={points}
+              onPointsChange={setPoints}
+              requireApproval={requireApproval}
+              onRequireApprovalChange={setRequireApproval}
+              completionWindow={completionWindow}
+              onCompletionWindowChange={setCompletionWindow}
+              deadlineOffset={deadlineOffset}
+              onDeadlineOffsetChange={setDeadlineOffset}
+              assignStrategy={assignStrategy}
+              onAssignStrategyChange={setAssignStrategy}
+              hasDueDate={!!dueDate}
+              hasMultipleAssignees={assignees.length > 1}
+              // Empty assignees still implicitly assigns the current user at
+              // create time; only an "Anyone" task truly has no assignee
+              hasAssignees={!isAnyoneTask}
+              isPrivate={isPrivate}
+              onIsPrivateChange={setIsPrivate}
+              isPrivacyInherited={selectedProjectIsPrivate}
+            />
+
+            {hasDescription && (
+              <Box>
+                <Typography level='body-sm'>
+                  {t('addTask.descriptionLabel')}
+                </Typography>
+                <div>
+                  <RichTextEditor
+                    ref={richTextEditorRef}
+                    onChange={setDescription}
+                    value={description || ''}
+                    entityType={'chore_description'}
+                    draftId={draftId}
+                  />
+                </div>
+              </Box>
+            )}
+            {hasSubTasks && (
+              <Box>
+                <Typography level='body-sm'>
+                  {t('addTask.subtasksLabel')}
+                </Typography>
+                <SubTasks
+                  editMode={true}
+                  tasks={subTasks ? subTasks : []}
+                  setTasks={setSubTasks}
+                  shouldFocus={true}
+                />
+              </Box>
+            )}
+          </>
+        )}
+
+        {showVoice && (
+          <VoicePanel
+            userLabels={voiceLabels}
+            members={voiceMembers}
+            userProfile={userProfile}
+            defaultNotificationTemplates={voiceDefaultNotificationTemplates}
+            onStateChange={setVoiceState}
+          />
+        )}
+
+        {showScan && (
+          <ScanPanel
+            open
+            autoCapture={scanAutoCapture}
+            canKeepImage={
+              isPlusAccount(userProfile) && !scanImageAlreadyAttached
+            }
+            onTaskExtracted={handleTaskExtracted}
+            onImageCaptured={handleBackgroundScanCaptured}
+            initialImageUrl={pendingPhotoUrl}
+            onStateChange={setScanState}
+            onClose={() => {
+              setShowScan(false)
+              setScanAutoCapture(false)
+              setPendingPhotoUrl(null)
+              setScanImageAlreadyAttached(false)
+              setScanState({ phase: 'idle', primaryAction: null })
+            }}
+          />
+        )}
+      </ResponsiveModal>
+    </>
+  )
+}
+
+export default TaskInput

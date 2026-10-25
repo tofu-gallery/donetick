@@ -1,0 +1,633 @@
+import {
+  AllInclusive,
+  Check,
+  Group,
+  HourglassEmpty,
+  OpenInNew,
+  Pause,
+  PlayArrow,
+  Repeat,
+  ThumbDown,
+  ThumbUp,
+  TimesOneMobiledata,
+  Toll,
+  Webhook,
+} from '@mui/icons-material'
+import {
+  Avatar,
+  Box,
+  Card,
+  Checkbox,
+  Chip,
+  Grid,
+  IconButton,
+  Typography,
+} from '@mui/joy'
+import { useTranslation } from 'react-i18next'
+
+import { useImpersonateUser } from '../../contexts/ImpersonateUserContext.jsx'
+import { useLocalization } from '../../contexts/LocalizationContext'
+import { usePendingCommands } from '../../hooks/usePendingCommands'
+import { useUserProfile } from '../../queries/UserQueries.jsx'
+import {
+  getDueDateChipColor,
+  getDueDateChipText,
+  getRecurrentChipText,
+} from '../../utils/ChoreCardHelpers.jsx'
+import { notInCompletionWindow } from '../../utils/Chores.jsx'
+import { getTextColorFromBackgroundColor } from '../../utils/Colors.jsx'
+import {
+  getFirstHttpUrl,
+  getUrlHostname,
+  openExternalUrl,
+  splitTextAtFirstHttpUrl,
+} from '../../utils/ExternalLinks.js'
+import Priorities from '../../utils/Priorities'
+import ChoreActionMenu, {
+  ChoreActionMenuTrigger,
+} from '../components/ChoreActionMenu'
+import PendingBadge from '../components/PendingBadge'
+
+// Hoisted so emotion isn't re-serializing an identical object for every row
+const ACTION_MENU_SX = {
+  width: 32,
+  height: 32,
+  color: 'text.tertiary',
+  flexShrink: 0,
+  '&:hover': {
+    color: 'text.secondary',
+    bgcolor: 'background.level1',
+  },
+}
+
+const ChoreCard = ({
+  chore,
+  isMultiSelectMode = false,
+  isSelected = false,
+  onAction,
+  onChipClick,
+  // When given, the row renders only a trigger and the list owns one shared
+  // action menu; without it the card falls back to carrying its own.
+  onOpenActionMenu,
+  onSelectionToggle,
+  performers,
+  // Multi-select props
+  showActions = true,
+  sx,
+  viewOnly,
+}) => {
+  const { t } = useTranslation('chores')
+  const { data: userProfile } = useUserProfile({ enabled: !viewOnly })
+  const { timeFormat } = useLocalization()
+  const { data: pendingCmds } = usePendingCommands(chore.id)
+
+  const { impersonatedUser } = useImpersonateUser()
+
+  // Check if the current user can approve/reject (admin, manager, or task owner)
+  const canApproveReject = () => {
+    if (!performers || !chore) return false
+
+    const currentUser = performers.find(
+      member => member.userId === (impersonatedUser?.userId || userProfile?.id),
+    )
+
+    // User can approve/reject if they are:
+    // 1. Admin or manager of the circle
+    // 2. Owner/creator of the task
+    return (
+      currentUser?.role === 'admin' ||
+      currentUser?.role === 'manager' ||
+      chore.createdBy === (impersonatedUser?.userId || userProfile?.id)
+    )
+  }
+
+  const getFrequencyIcon = chore => {
+    if (['once', 'no_repeat'].includes(chore.frequencyType)) {
+      return <TimesOneMobiledata />
+    } else if (chore.frequencyType === 'trigger') {
+      return <Webhook />
+    } else if (chore.frequencyType === 'always') {
+      return <AllInclusive />
+    } else {
+      return <Repeat />
+    }
+  }
+  const getName = name => {
+    const split = Array.from(chore.name)
+    // if the first character is emoji then remove it from the name
+    if (isNaN(Number(split[0])) && /\p{Emoji}/u.test(split[0])) {
+      return split.slice(1).join('').trim()
+    }
+    return name
+  }
+  const displayName = getName(chore.name)
+  const {
+    after: titleAfterUrl,
+    before: titleBeforeUrl,
+    url: titleUrl,
+  } = splitTextAtFirstHttpUrl(displayName)
+  const descriptionUrl = getFirstHttpUrl(chore.description)
+  const showDescriptionUrl = descriptionUrl && descriptionUrl !== titleUrl
+
+  return (
+    <Box
+      key={chore.id + '-box'}
+      minWidth={'100%'}
+      sx={{ position: 'relative' }}
+    >
+      {chore.frequencyType !== 'always' && (
+        <Chip
+          variant='soft'
+          sx={{
+            position: 'relative',
+            top: 10,
+            zIndex: 3,
+            left: 10,
+          }}
+          color={getDueDateChipColor(chore.nextDueDate, chore)}
+        >
+          {getDueDateChipText(chore.nextDueDate, chore, timeFormat)}
+        </Chip>
+      )}
+
+      {!['once', 'no_repeat'].includes(chore.frequencyType) && (
+        <Chip
+          variant='soft'
+          sx={{
+            position: 'relative',
+            top: 10,
+            zIndex: 3,
+            ml: 0.4,
+            left: 10,
+          }}
+        >
+          <div
+            style={{
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+            }}
+          >
+            {getFrequencyIcon(chore)}
+            {getRecurrentChipText(chore)}
+          </div>
+        </Chip>
+      )}
+
+      <Box sx={{ position: 'absolute', top: 10, right: 10, zIndex: 3 }}>
+        <PendingBadge commands={pendingCmds} />
+      </Box>
+      <Box
+        sx={{
+          position: 'relative',
+          overflow: 'hidden',
+          borderRadius: 20,
+        }}
+      >
+        <Card
+          style={viewOnly ? { pointerEvents: 'none' } : {}}
+          variant='plain'
+          sx={{
+            ...sx,
+            display: 'flex',
+            flexDirection: 'column',
+            justifyContent: 'space-between',
+            p: 2,
+            boxShadow: 'sm',
+            borderRadius: 20,
+            key: `${chore.id}-card`,
+            position: 'relative',
+            backgroundColor: 'background.surface',
+            border: '1px solid',
+            borderColor: 'divider',
+            cursor: isMultiSelectMode ? 'pointer' : 'default',
+            '&:hover': {
+              boxShadow: 'md',
+              borderColor: isMultiSelectMode ? 'primary.500' : 'primary.300',
+            },
+            // Add padding when in multi-select mode to account for checkbox
+            pl: isMultiSelectMode ? 6 : 2,
+            // Visual feedback when selected
+            ...(isMultiSelectMode &&
+              isSelected && {
+                borderColor: 'primary.500',
+                backgroundColor: 'primary.softBg',
+                boxShadow: 'sm',
+              }),
+          }}
+        >
+          {/* Multi-select checkbox */}
+          {isMultiSelectMode && (
+            <Checkbox
+              checked={isSelected}
+              onChange={onSelectionToggle}
+              sx={{
+                position: 'absolute',
+                top: '50%',
+                left: 12,
+                transform: 'translateY(-50%)',
+                zIndex: 2,
+                bgcolor: 'background.surface',
+                borderRadius: 'md',
+                borderColor: 'divider',
+                '&:hover': {
+                  bgcolor: 'background.level1',
+                  borderColor: 'primary.300',
+                },
+                '&.Mui-checked': {
+                  bgcolor: 'primary.500',
+                  borderColor: 'primary.500',
+                  color: 'primary.solidColor',
+                  '&:hover': {
+                    bgcolor: 'primary.600',
+                    borderColor: 'primary.600',
+                  },
+                },
+              }}
+              onClick={e => e.stopPropagation()}
+            />
+          )}
+          <Grid container>
+            <Grid
+              xs={9}
+              sx={{ cursor: 'pointer' }}
+              // onClick={() => {
+              //   if (isMultiSelectMode) {
+              //     onSelectionToggle()
+              //   } else {
+              //     navigate(`/chores/${chore.id}`)
+              //   }
+              // }}
+            >
+              {/* Box in top right with Chip showing next due date  */}
+              <Box display='flex' justifyContent='start' alignItems='center'>
+                <Avatar sx={{ mr: 1, fontSize: 22 }}>
+                  {Array.from(chore.name)[0]}
+                </Avatar>
+                <Box display='flex' flexDirection='column'>
+                  <Typography level='title-md'>
+                    {titleBeforeUrl}
+                    {titleUrl && (
+                      <Chip
+                        component='span'
+                        variant='soft'
+                        color='primary'
+                        size='sm'
+                        startDecorator={<OpenInNew sx={{ fontSize: 14 }} />}
+                        onClick={event => {
+                          event.stopPropagation()
+                          openExternalUrl(titleUrl)
+                        }}
+                        sx={{
+                          mx: 0.4,
+                          maxWidth: 180,
+                          cursor: 'pointer',
+                          verticalAlign: 'middle',
+                          '& .MuiChip-label': {
+                            overflow: 'hidden',
+                            textOverflow: 'ellipsis',
+                          },
+                        }}
+                        title={titleUrl}
+                      >
+                        {getUrlHostname(titleUrl)}
+                      </Chip>
+                    )}
+                    {titleAfterUrl}
+                  </Typography>
+                  {chore.assignedTo && (
+                    <Box display='flex' alignItems='center' gap={0.5}>
+                      <Chip
+                        variant='outlined'
+                        startDecorator={
+                          <Avatar
+                            src={
+                              performers.find(
+                                p => p.userId === chore.assignedTo,
+                              )?.image
+                            }
+                          />
+                        }
+                      >
+                        {
+                          performers.find(p => p.userId === chore.assignedTo)
+                            ?.displayName
+                        }
+                      </Chip>
+                    </Box>
+                  )}
+                  {chore.assignedTo === null && (
+                    <Box display='flex' alignItems='center' gap={0.5}>
+                      <Chip variant='outlined' startDecorator={<Group />}>
+                        {t('choreCard.anyone')}
+                      </Chip>
+                    </Box>
+                  )}
+                  <Box key={`${chore.id}-labels`}>
+                    {chore.priority > 0 && (
+                      <Chip
+                        sx={{
+                          position: 'relative',
+                          mr: 0.5,
+                          top: 2,
+                          zIndex: 1,
+                        }}
+                        color={
+                          chore.priority === 1
+                            ? 'danger'
+                            : chore.priority === 2
+                              ? 'warning'
+                              : 'neutral'
+                        }
+                        startDecorator={
+                          Priorities.find(p => p.value === chore.priority)?.icon
+                        }
+                        onClick={e => {
+                          e.stopPropagation()
+                          onChipClick({ priority: chore.priority })
+                        }}
+                      >
+                        P{chore.priority}
+                      </Chip>
+                    )}
+                    {/* show points chip if there is points assigned */}
+                    {chore.points > 0 && (
+                      <Chip
+                        sx={{
+                          position: 'relative',
+                          mr: 0.5,
+                          top: 2,
+                          zIndex: 1,
+                        }}
+                        color='success'
+                        startDecorator={<Toll />}
+                      >
+                        {chore.points}
+                      </Chip>
+                    )}
+                    {showDescriptionUrl && (
+                      <Chip
+                        variant='soft'
+                        color='primary'
+                        startDecorator={<OpenInNew sx={{ fontSize: 16 }} />}
+                        onClick={event => {
+                          event.stopPropagation()
+                          openExternalUrl(descriptionUrl)
+                        }}
+                        sx={{
+                          position: 'relative',
+                          mr: 0.5,
+                          top: 2,
+                          zIndex: 1,
+                          maxWidth: 180,
+                          cursor: 'pointer',
+                          '& .MuiChip-label': {
+                            overflow: 'hidden',
+                            textOverflow: 'ellipsis',
+                          },
+                        }}
+                        title={descriptionUrl}
+                      >
+                        {getUrlHostname(descriptionUrl)}
+                      </Chip>
+                    )}
+                    {chore.labelsV2?.map((l, index) => {
+                      return (
+                        <div
+                          role='none'
+                          tabIndex={0}
+                          onClick={e => {
+                            e.stopPropagation()
+                            onChipClick({ label: l })
+                          }}
+                          onKeyDown={e => {
+                            if (e.key === 'Enter' || e.key === ' ') {
+                              e.stopPropagation()
+                              onChipClick({ label: l })
+                            }
+                          }}
+                          style={{ display: 'inline-block', cursor: 'pointer' }} // Make the wrapper clickable
+                          key={`chorecard-${chore.id}-label-${l.id}`}
+                        >
+                          <Chip
+                            variant='solid'
+                            color='primary'
+                            sx={{
+                              position: 'relative',
+                              ml: index === 0 ? 0 : 0.5,
+                              top: 2,
+                              zIndex: 1,
+                              backgroundColor: `${l?.color} !important`,
+                              color: getTextColorFromBackgroundColor(l?.color),
+
+                              // apply background color for th clickable button:
+                            }}
+                            // onClick={e => {
+                            //   e.stopPropagation()
+                            //   onChipClick({ label: l })
+                            // }}
+
+                            // startDecorator={getIconForLabel(label)}
+                          >
+                            {l?.name}
+                          </Chip>
+                        </div>
+                      )
+                    })}
+                  </Box>
+                </Box>
+              </Box>
+              {/* <Box display='flex' justifyContent='space-between' alignItems='center'>
+          <Chip variant='outlined'>
+            {chore.nextDueDate === null
+              ? '--'
+              : 'Due ' + moment(chore.nextDueDate).fromNow()}
+          </Chip>
+        </Box> */}
+            </Grid>
+            <Grid
+              xs={3}
+              sx={{
+                display: 'flex',
+                flexDirection: 'column',
+                alignItems: 'flex-end',
+                justifyContent: 'center',
+              }}
+            >
+              {showActions && (
+                <Box
+                  display='flex'
+                  justifyContent='flex-end'
+                  alignItems='flex-end'
+                >
+                  {/* <ButtonGroup> */}
+                  {chore.status === 3 ? (
+                    // Pending approval: Show approve/reject for admins/managers/owners, grayed out for others
+                    canApproveReject() ? (
+                      <Box sx={{ display: 'flex', gap: 0.5 }}>
+                        <IconButton
+                          variant='soft'
+                          color='success'
+                          onClick={e => {
+                            e.stopPropagation()
+                            onAction('approve', chore)
+                          }}
+                          sx={{
+                            borderRadius: '50%',
+                            width: 50,
+                            minWidth: 50,
+                            height: 50,
+                            flexShrink: 0,
+                            zIndex: 1,
+                            transition: 'all 0.2s ease',
+                            '&:hover': {
+                              transform: 'scale(1.05)',
+                            },
+                            '&:active': {
+                              transform: 'scale(0.95)',
+                            },
+                            '&:disabled': {
+                              opacity: 0.5,
+                              transform: 'none',
+                            },
+                          }}
+                        >
+                          <ThumbUp sx={{ fontSize: 18 }} />
+                        </IconButton>
+                        <IconButton
+                          variant='soft'
+                          color='danger'
+                          onClick={e => {
+                            e.stopPropagation()
+                            onAction('reject', chore)
+                          }}
+                          sx={{
+                            borderRadius: '50%',
+                            width: 50,
+                            minWidth: 50,
+                            height: 50,
+                            flexShrink: 0,
+                            zIndex: 1,
+                            transition: 'all 0.2s ease',
+                            '&:hover': {
+                              transform: 'scale(1.05)',
+                            },
+                            '&:active': {
+                              transform: 'scale(0.95)',
+                            },
+                          }}
+                        >
+                          <ThumbDown sx={{ fontSize: 18 }} />
+                        </IconButton>
+                      </Box>
+                    ) : (
+                      <IconButton
+                        variant='soft'
+                        color='neutral'
+                        disabled={true}
+                        sx={{
+                          borderRadius: '50%',
+                          width: 50,
+                          minWidth: 50,
+                          height: 50,
+                          flexShrink: 0,
+                          zIndex: 1,
+                          opacity: 0.5,
+                        }}
+                      >
+                        <HourglassEmpty />
+                      </IconButton>
+                    )
+                  ) : (
+                    <IconButton
+                      variant={chore.status === 0 ? 'solid' : 'soft'}
+                      color={chore.status === 0 ? 'success' : 'warning'}
+                      onClick={e => {
+                        e.stopPropagation()
+                        switch (chore.status) {
+                          case 0: // Not started
+                            onAction('complete', chore)
+                            break
+                          case 1: // In progress
+                            onAction('pause', chore)
+                            break
+                          case 2: // Paused
+                            onAction('start', chore)
+                            break
+                          default:
+                            break
+                        }
+                      }}
+                      disabled={notInCompletionWindow(chore)}
+                      sx={{
+                        borderRadius: '50%',
+                        width: 50,
+                        minWidth: 50,
+                        height: 50,
+                        flexShrink: 0,
+                        zIndex: 1,
+                        transition: 'all 0.2s ease',
+                        '&:hover': {
+                          transform: 'scale(1.05)',
+                        },
+                        '&:active': {
+                          transform: 'scale(0.95)',
+                        },
+                        '&:disabled': {
+                          opacity: 0.5,
+                          transform: 'none',
+                        },
+                      }}
+                    >
+                      <div className='relative grid place-items-center'>
+                        {chore.status === 0 ? (
+                          <Check />
+                        ) : chore.status === 1 ? (
+                          <Pause />
+                        ) : (
+                          <PlayArrow />
+                        )}
+                      </div>
+                    </IconButton>
+                  )}
+                  {onOpenActionMenu ? (
+                    <ChoreActionMenuTrigger
+                      variant='plain'
+                      onClick={event => {
+                        event.stopPropagation()
+                        onOpenActionMenu(event.currentTarget, chore)
+                      }}
+                      sx={ACTION_MENU_SX}
+                    />
+                  ) : (
+                    <ChoreActionMenu
+                      variant='plain'
+                      chore={chore}
+                      onCompleteWithNote={() =>
+                        onAction('completeWithNote', chore)
+                      }
+                      onCompleteWithPastDate={() =>
+                        onAction('completeWithPastDate', chore)
+                      }
+                      onAction={(type, chore, extraData) =>
+                        onAction(type, chore, extraData)
+                      }
+                      onChangeAssignee={() => onAction('changeAssignee', chore)}
+                      onChangeDueDate={() => onAction('changeDueDate', chore)}
+                      onWriteNFC={() => onAction('writeNFC', chore)}
+                      onNudge={() => onAction('nudge', chore)}
+                      onDelete={() => onAction('delete', chore)}
+                      sx={ACTION_MENU_SX}
+                    />
+                  )}
+                </Box>
+              )}
+            </Grid>
+          </Grid>
+        </Card>
+      </Box>
+    </Box>
+  )
+}
+
+export default ChoreCard

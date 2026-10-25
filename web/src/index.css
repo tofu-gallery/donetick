@@ -1,0 +1,84 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Global animations for smooth interactions */
+@keyframes spin {
+  from {
+    transform: rotate(0deg);
+  }
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/* Smooth scrolling for better UX */
+html {
+  scroll-behavior: smooth;
+}
+
+/* Prevent accidental horizontal overflow from ever creating a scrollable
+ * page — on iOS/WKWebView, sideways rubber-band bounce makes `position:
+ * fixed` elements (e.g. the mobile bottom nav) visibly drift during scroll. */
+html,
+body {
+  overflow-x: hidden;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  html {
+    scroll-behavior: auto;
+  }
+}
+
+/* Global focus styles for better accessibility */
+*:focus-visible {
+  outline: 2px solid #0ea5e9;
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+
+/* Prevent iOS Safari from auto-zooming on input focus (triggered when font-size
+   < 16px — and iOS never zooms back out on blur, so the page stays zoomed).
+   Joy's Input/Textarea slots set `font-size: inherit` on the native element via
+   an emotion class, which out-specifies a bare `input` selector and leaves
+   size="sm" fields at 14px — hence the element+class compounds below. */
+@supports (-webkit-touch-callout: none) {
+  input,
+  textarea,
+  select,
+  input.MuiInput-input,
+  input.MuiAutocomplete-input,
+  textarea.MuiTextarea-textarea {
+    font-size: max(16px, 1em);
+  }
+}
+
+/* Ensure smooth transitions for dynamic content */
+* {
+  box-sizing: border-box;
+}
+
+/* Optimize animations for performance */
+.animate-optimized {
+  will-change: transform, opacity;
+}
+
+.animate-optimized.animation-complete {
+  will-change: auto;
+}
+
+/*
+ * RTL Support
+ *
+ * Component styling is mirrored by stylis-plugin-rtl (see ThemeContext), which
+ * flips the physical properties emitted by `sx`. Do not add per-component
+ * `[dir='rtl']` overrides here — they fight the plugin and double-flip.
+ *
+ * Only opt-in utilities belong in this block:
+ *   .rtl-flip — mirror an icon that encodes a direction (arrows, chevrons).
+ *               Do NOT use it on symbols that read the same either way.
+ */
+[dir='rtl'] .rtl-flip {
+  transform: scaleX(-1);
+}

@@ -1,0 +1,108 @@
+:root,
+[data-joy-color-scheme='light'] {
+  --highlight-date-color: #b45309;
+  --highlight-repeat-color: #15803d;
+  --highlight-label-color: #1d4ed8;
+  --highlight-priority-color: #be123c;
+}
+
+[data-joy-color-scheme='dark'] {
+  --highlight-date-color: #fca5a5;
+  --highlight-repeat-color: #86efac;
+  --highlight-label-color: #93c5fd;
+  --highlight-priority-color: #f9a8d4;
+}
+
+.smart-task-display {
+  position: absolute;
+  width: 100%;
+  z-index: 10;
+  pointer-events: none;
+  padding: 0px;
+  margin: 0;
+  border: none;
+  overflow-y: auto;
+  word-wrap: break-word;
+  white-space: pre-wrap;
+  box-sizing: border-box;
+}
+
+.smart-task-common {
+  font-size: 1.2em;
+  line-height: 1.2em;
+  font-family: inherit;
+}
+
+.highlight-date {
+  color: var(--highlight-date-color);
+}
+
+.highlight-repeat {
+  color: var(--highlight-repeat-color);
+}
+
+.highlight-label {
+  color: var(--highlight-label-color);
+}
+
+.highlight-priority {
+  color: var(--highlight-priority-color);
+}
+
+.highlight-assignee {
+  color: var(--highlight-repeat-color);
+}
+
+.highlight-points {
+  color: var(--highlight-label-color);
+}
+
+/* Played once when a token is first detected: the dashed underline fades in
+   while a soft tint of the token's own color flashes and clears. Keyframe
+   values override the span's inline text-decoration while running. */
+@keyframes smart-highlight-in {
+  from {
+    text-decoration-color: transparent;
+    background-color: color-mix(in srgb, currentColor 22%, transparent);
+  }
+  60% {
+    background-color: color-mix(in srgb, currentColor 12%, transparent);
+  }
+  to {
+    text-decoration-color: currentColor;
+    background-color: transparent;
+  }
+}
+
+.highlight-appear {
+  border-radius: 4px;
+  animation: smart-highlight-in 450ms ease-out;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .highlight-appear {
+    animation: none;
+  }
+}
+
+.task-input {
+  position: relative;
+  width: 100%;
+  border-radius: 10px;
+  box-sizing: border-box;
+  border: none;
+  background-color: var(--joy-palette-neutral-softBg, #f0f4f8);
+  overflow: auto;
+  transition:
+    box-shadow 0.15s ease,
+    background-color 0.15s ease;
+}
+
+.task-input:focus-within {
+  box-shadow: 0 0 0 2px
+    var(--joy-palette-primary-outlinedBorder, rgba(11, 107, 203, 0.15));
+}
+
+.task-input:hover:not(:focus-within) {
+  background-color: var(--joy-palette-neutral-softHoverBg, #dde7ee);
+}

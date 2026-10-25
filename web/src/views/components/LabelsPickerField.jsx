@@ -1,0 +1,82 @@
+import { Add, Label } from '@mui/icons-material'
+import { Button } from '@mui/joy'
+import { useState } from 'react'
+import { useTranslation } from 'react-i18next'
+
+import LabelModal from '../Modals/Inputs/LabelModal'
+import BaseOptionPicker from './BaseOptionPicker'
+
+const LabelsPickerField = ({
+  emptyDisplay = 'icon-text',
+  labels = [],
+  onChange,
+  onClear,
+  values = [],
+}) => {
+  const { t } = useTranslation('labels')
+  const [createOpen, setCreateOpen] = useState(false)
+  const [pickerOpen, setPickerOpen] = useState(false)
+
+  const options = labels.map(label => ({
+    id: label.id,
+    name: label.name,
+    color: label.color,
+  }))
+
+  return (
+    <>
+      <BaseOptionPicker
+        items={options}
+        multiple
+        values={values}
+        onValuesChange={onChange}
+        onClear={onClear}
+        open={pickerOpen}
+        onOpenChange={setPickerOpen}
+        emptyDisplay={emptyDisplay}
+        emptyLabel={t('picker.label')}
+        getItemValue={item => item.id}
+        getItemLabel={item => item.name}
+        getItemColor={item => item.color}
+        renderTriggerIcon={() => <Label sx={{ fontSize: '20px' }} />}
+        renderItemStart={({ item }) => (
+          <Label
+            sx={{
+              fontSize: '18px',
+              color: item.color || 'text.secondary',
+            }}
+          />
+        )}
+        getTriggerText={({ isEmpty, selectedItems }) => {
+          if (isEmpty) return t('picker.label')
+          if (selectedItems.length === 1) return selectedItems[0].name
+          return t('picker.labelsCount', { count: selectedItems.length })
+        }}
+        menuMinWidth={220}
+        menuFooter={
+          <Button
+            size='sm'
+            variant='plain'
+            color='neutral'
+            startDecorator={<Add sx={{ fontSize: '16px' }} />}
+            onClick={e => {
+              e.stopPropagation()
+              setPickerOpen(false)
+              setCreateOpen(true)
+            }}
+            sx={{ width: '100%', justifyContent: 'flex-start' }}
+          >
+            {t('picker.createLabel')}
+          </Button>
+        }
+      />
+      <LabelModal
+        isOpen={createOpen}
+        onClose={() => setCreateOpen(false)}
+        label={null}
+      />
+    </>
+  )
+}
+
+export default LabelsPickerField

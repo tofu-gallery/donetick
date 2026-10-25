@@ -1,0 +1,800 @@
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import { useState } from 'react'
+
+import { track } from '../analytics'
+import { networkManager } from '../hooks/NetworkManager'
+import { commandQueue, CommandType } from '../utils/CommandQueue'
+import {
+  ApproveChore,
+  ArchiveChore,
+  CreateChore,
+  DeleteChore,
+  DeleteChoreHistory,
+  GetChoreAttachments,
+  GetChoreByID,
+  GetChoreDetailById,
+  GetChoreHistory,
+  GetChoresHistory,
+  GetChoresNew,
+  MarkChoreComplete,
+  RejectChore,
+  SaveChore,
+  SkipChore,
+  UnArchiveChore,
+  UpdateChoreHistory,
+} from '../utils/Fetcher'
+import { cacheChoreImages } from '../utils/ImageCache'
+import { offlineDB } from '../utils/OfflineDB'
+import { isOfflineFeatureEnabled } from '../utils/OfflineFeatureToggle'
+import { syncEngine } from '../utils/SyncEngine'
+
+const mergePendingCreates = async chores => {
+  const pending = await commandQueue.getPending()
+  const pendingCreates = pending.filter(
+    cmd => cmd.commandType === CommandType.CREATE_CHORE,
+  )
+  const deletedIds = new Set(
+    pending
+      .filter(cmd => cmd.commandType === CommandType.DELETE_CHORE)
+      .map(cmd => String(cmd.entityId)),
+  )
+
+  if (pendingCreates.length === 0) return chores
+
+  const existingIds = new Set((chores || []).map(chore => String(chore.id)))
+  const createdFromQueue = pendingCreates
+    .filter(
+      cmd =>
+        !existingIds.has(String(cmd.entityId)) &&
+        !deletedIds.has(String(cmd.entityId)),
+    )
+    .map(cmd => {
+      const payload = cmd.payload || {}
+      return {
+        ...payload,
+        id: cmd.entityId,
+        nextDueDate: payload.nextDueDate || payload.dueDate || null,
+        _pendingCreate: true,
+      }
+    })
+
+  return [...(chores || []), ...createdFromQueue]
+}
+
+// Effectively "can this action be queued offline?" — the offline feature must
+// be enabled, otherwise there is no command queue to replay it later and the
+// failure should surface to the user instead.
+const isNetworkError = error =>
+  isOfflineFeatureEnabled() &&
+  ((error instanceof TypeError && error.message === 'Failed to fetch') ||
+    error?.name === 'AbortError')
+
+// The backend returns { error: "..." } on failures. Surface that message when
+// it is there, flagged so callers can tell it apart from our generic fallback.
+const errorFromResponse = async (resp, fallbackMessage) => {
+  if (!resp) return new Error(fallbackMessage)
+  let serverMessage = null
+  try {
+    const body = await resp.json()
+    if (typeof body?.error === 'string' && body.error.trim() !== '') {
+      serverMessage = body.error
+    }
+  } catch {
+    // body was empty or not JSON, keep the fallback
+  }
+  const error = new Error(serverMessage || fallbackMessage)
+  error.isServerMessage = Boolean(serverMessage)
+  return error
+}
+
+const buildOfflineChore = task => ({
+  ...task,
+  id: 'temp_' + Date.now() + '_' + Math.random().toString(36).substr(2, 9),
+  nextDueDate: task.nextDueDate || task.dueDate || null,
+  _pendingCreate: true,
+})
+
+export const useChores = (includeArchive = false, { enabled = true } = {}) => {
+  return useQuery({
+    queryKey: ['chores', includeArchive],
+    refetchOnWindowFocus: true,
+    enabled,
+    queryFn: async () => {
+      if (isOfflineFeatureEnabled()) {
+        try {
+          // Sync from server first (coalesced with any run already in flight,
+          // so a just-created chore can't be missed by a stale cursor)
+          if (networkManager.isOnline) {
+            await syncEngine.sync()
+          }
+          const cursor = await offlineDB.getSyncCursor()
+          if (cursor > 0) {
+            const cached = await offlineDB.getChores(includeArchive)
+            const merged = await mergePendingCreates(cached || [])
+            return { res: merged }
+          }
+        } catch (err) {
+          // A broken cache must not brick the app — fall through to the API
+          console.error('Offline cache read failed, falling back to API', err)
+        }
+      }
+
+      // Offline feature disabled — fetch from API.
+      try {
+        const data = await GetChoresNew(includeArchive)
+        if (data?.res) {
+          // Only the archived-inclusive fetch is the complete list, which
+          // allows cacheChores to reconcile server-side deletions
+          syncEngine.cacheChores(data.res, {
+            complete: includeArchive === true,
+          })
+        }
+        const merged = await mergePendingCreates(data?.res || [])
+        return { ...data, res: merged }
+      } catch {
+        // API failed — fall back to whatever is in the cache
+        const cached = await offlineDB.getChores(includeArchive)
+        const merged = await mergePendingCreates(cached || [])
+        if (merged && merged.length > 0) {
+          return { res: merged }
+        }
+        throw new Error(
+          'Unable to communicate with server and no data available',
+        )
+      }
+    },
+  })
+}
+export const useDeleteChores = () => {
+  const queryClient = useQueryClient()
+
+  return useMutation({
+    mutationFn: async choreIds => {
+      if (isOfflineFeatureEnabled() && !networkManager.isOnline) {
+        await offlineDB.deleteChores(choreIds)
+        await Promise.all(
+          choreIds.map(async id => {
+            await commandQueue.enqueue(CommandType.DELETE_CHORE, id, { id })
+          }),
+        )
+
+        const removeDeletedChores = oldData => {
+          if (!oldData?.res) return oldData
+
+          const deletedIds = new Set(choreIds.map(id => String(id)))
+          return {
+            ...oldData,
+            res: oldData.res.filter(chore => !deletedIds.has(String(chore.id))),
+          }
+        }
+
+        queryClient.setQueryData(['chores', false], removeDeletedChores)
+        queryClient.setQueryData(['chores', true], removeDeletedChores)
+        return
+      }
+      await Promise.all(
+        choreIds.map(async id => {
+          const resp = await DeleteChore(id)
+          if (!resp || !resp.ok) {
+            throw new Error(`Failed to delete chore with ID: ${id}`)
+          }
+        }),
+      )
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['chores'] })
+      queryClient.invalidateQueries({ queryKey: ['pendingCommands'] })
+    },
+  })
+}
+export const useCreateChore = () => {
+  const queryClient = useQueryClient()
+
+  const queueOfflineCreate = async newTask => {
+    const offlineChore = buildOfflineChore(newTask)
+    await commandQueue.enqueue(
+      CommandType.CREATE_CHORE,
+      offlineChore.id,
+      newTask,
+    )
+
+    queryClient.setQueryData(['chores', false], oldData => {
+      if (!oldData?.res) {
+        return { res: [offlineChore] }
+      }
+
+      const alreadyExists = oldData.res.some(
+        chore => String(chore.id) === String(offlineChore.id),
+      )
+      if (alreadyExists) return oldData
+
+      return { ...oldData, res: [...oldData.res, offlineChore] }
+    })
+
+    return offlineChore
+  }
+
+  return useMutation({
+    mutationFn: async rawTask => {
+      // `source` is analytics-only metadata (typed/voice/scan/clone) — never
+      // send it to the backend as part of the chore payload.
+      const { source, ...newTask } = rawTask
+      if (isOfflineFeatureEnabled() && !networkManager.isOnline) {
+        return queueOfflineCreate(newTask)
+      }
+
+      try {
+        const resp = await CreateChore(newTask)
+        if (!resp || !resp.ok) {
+          throw await errorFromResponse(resp, 'Failed to create chore')
+        }
+        const createdChore = await resp.json()
+        if (!createdChore) {
+          throw new Error('Failed to get created chore data')
+        }
+        track('chore_created', {
+          has_due_date: Boolean(newTask.dueDate),
+          has_assignee: Boolean(newTask.assignedTo),
+          has_labels: Boolean(newTask.labelsV2?.length),
+          has_description: Boolean(newTask.description?.trim()),
+          has_recurrence: newTask.frequencyType !== 'once',
+          recurrence_type: newTask.frequencyType || 'once',
+          priority: typeof newTask.priority === 'number' ? newTask.priority : 0,
+          source: source || 'quick_add',
+        })
+        return { ...newTask, id: createdChore.res }
+      } catch (error) {
+        if (isNetworkError(error)) {
+          return queueOfflineCreate(newTask)
+        }
+        throw error
+      }
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['chores'] })
+      queryClient.invalidateQueries({ queryKey: ['pendingCommands'] })
+    },
+  })
+}
+
+export const useUpdateChore = () => {
+  const queryClient = useQueryClient()
+
+  return useMutation({
+    mutationFn: async updatedChore => {
+      const queueOfflineUpdate = async () => {
+        await commandQueue.enqueue(
+          CommandType.UPDATE_CHORE,
+          updatedChore.id,
+          updatedChore,
+        )
+        const pendingChore = { ...updatedChore, _pendingUpdate: true }
+        // Persist to offline DB so cache fallback reads the updated data
+        await offlineDB.saveChores([pendingChore])
+        queryClient.setQueryData(['chores', false], oldData => {
+          if (!oldData) return { res: [pendingChore] }
+          return {
+            res: oldData.res.map(chore =>
+              chore.id === updatedChore.id ? pendingChore : chore,
+            ),
+          }
+        })
+        queryClient.setQueryData(['chore', updatedChore.id], oldData => {
+          if (!oldData) return { res: pendingChore }
+          return { ...oldData, res: pendingChore }
+        })
+        return pendingChore
+      }
+
+      try {
+        const resp = await SaveChore(updatedChore)
+        if (!resp || !resp.ok) {
+          throw await errorFromResponse(resp, 'Failed to save chore')
+        }
+        const updatedChoreRes = await resp.json()
+        if (!updatedChoreRes) {
+          throw new Error('Failed to get updated chore data')
+        }
+        queryClient.setQueryData(['chores', false], oldData => {
+          if (!oldData) return { res: [updatedChore] }
+          return {
+            res: oldData.res.map(chore =>
+              chore.id === updatedChore.id ? updatedChore : chore,
+            ),
+          }
+        })
+        track('chore_updated', {
+          has_due_date: Boolean(updatedChore.dueDate),
+          has_assignee: Boolean(updatedChore.assignedTo),
+          has_labels: Boolean(updatedChore.labelsV2?.length),
+          has_description: Boolean(updatedChore.description?.trim()),
+          has_recurrence: updatedChore.frequencyType !== 'once',
+          recurrence_type: updatedChore.frequencyType || 'once',
+          priority:
+            typeof updatedChore.priority === 'number'
+              ? updatedChore.priority
+              : 0,
+        })
+        return updatedChoreRes?.res || updatedChore
+      } catch (error) {
+        if (isNetworkError(error)) {
+          return queueOfflineUpdate()
+        }
+        throw error
+      }
+    },
+    onSuccess: (_, variables) => {
+      queryClient.invalidateQueries({ queryKey: ['chores'] })
+      queryClient.invalidateQueries({
+        queryKey: ['choreHistory', variables.id],
+      })
+      queryClient.invalidateQueries({ queryKey: ['pendingCommands'] })
+    },
+  })
+}
+
+export const useChoresHistory = (initialLimit, includeMembers) => {
+  const [limit, setLimit] = useState(initialLimit) // Initially, no limit is selected
+
+  const { data, error, isLoading } = useQuery({
+    queryKey: ['choresHistory', limit],
+    queryFn: async () => {
+      try {
+        const resp = await GetChoresHistory(limit, includeMembers)
+        const entries = resp?.res || []
+        // Cache for offline use — fire-and-forget so a cache failure never
+        // degrades the online experience
+        if (entries.length > 0) {
+          offlineDB
+            .saveHistory(entries)
+            .catch(err => console.error('Failed to cache chores history:', err))
+        }
+        return entries
+      } catch {
+        return offlineDB.getHistoryByDays(limit)
+      }
+    },
+    staleTime: 0,
+  })
+
+  const handleLimitChange = newLimit => {
+    setLimit(newLimit)
+  }
+
+  return { data, error, isLoading, handleLimitChange }
+}
+
+export const useChoreDetails = choreId => {
+  return useQuery({
+    queryKey: ['choreDetails', choreId],
+    refetchOnWindowFocus: true,
+    queryFn: async () => {
+      let response
+      try {
+        response = await GetChoreDetailById(choreId)
+      } catch {
+        response = null
+      }
+
+      if (response && response.ok) {
+        return await response.json()
+      }
+
+      if (response && (response.status === 403 || response.status === 404)) {
+        // Server says this chore is gone/inaccessible (e.g. its project
+        // turned private) — purge the stale cache instead of serving it
+        await offlineDB.deleteChores([choreId]).catch(() => {})
+        throw new Error('Chore is no longer accessible')
+      }
+
+      // Network/server error — fall back to cached chore (without timer details)
+      const cached = await offlineDB.getChore(choreId)
+      if (cached) {
+        return { res: cached }
+      }
+      throw new Error('Chore detail not available offline')
+    },
+  })
+}
+
+export const useChore = choreId => {
+  const queryClient = useQueryClient()
+
+  return useQuery({
+    queryKey: ['chore', choreId],
+    queryFn: async () => {
+      if (!choreId) {
+        throw new Error('Chore ID is required to fetch chore details')
+      }
+
+      let response
+      try {
+        response = await GetChoreByID(choreId)
+      } catch {
+        response = null
+      }
+
+      if (response && response.ok) {
+        const data = await response.json()
+        // Fire-and-forget: store this chore's images (incl. attachments,
+        // which only appear in detail responses) for offline use
+        if (data?.res) cacheChoreImages(data.res)
+        return data
+      }
+
+      if (response && (response.status === 403 || response.status === 404)) {
+        // Server says this chore is gone/inaccessible (e.g. its project
+        // turned private) — purge the stale cache instead of serving it
+        await offlineDB.deleteChores([choreId]).catch(() => {})
+        throw new Error('Chore is no longer accessible')
+      }
+
+      // Network/server error — try offline cache
+      const cached = await offlineDB.getChore(choreId)
+      if (cached) {
+        return { res: cached }
+      }
+      throw new Error('Chore not available offline')
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['chores'] })
+    },
+  })
+}
+
+export const useArchiveChore = () => {
+  const queryClient = useQueryClient()
+
+  return useMutation({
+    mutationFn: ArchiveChore,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['chores'] })
+    },
+  })
+}
+
+export const useUnArchiveChore = () => {
+  const queryClient = useQueryClient()
+
+  return useMutation({
+    mutationFn: UnArchiveChore,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['chores'] })
+    },
+  })
+}
+
+export const useChoreHistory = choreId => {
+  return useQuery({
+    queryKey: ['choreHistory', choreId],
+    queryFn: async () => {
+      if (!choreId) {
+        throw new Error('Chore ID is required to fetch history')
+      }
+      let json
+      try {
+        const response = await GetChoreHistory(choreId)
+        if (response && response.ok) {
+          json = await response.json()
+        } else {
+          throw new Error('Failed to fetch chore history')
+        }
+      } catch {
+        const cached = await offlineDB.getHistoryByChore(choreId)
+        return { res: cached }
+      }
+      // Cache for offline use — fire-and-forget so a cache failure never
+      // degrades the online view. Inject choreId since the single-chore
+      // endpoint may omit it from each entry.
+      const entries = (json?.res || []).map(e =>
+        e.choreId != null ? e : { ...e, choreId: Number(choreId) },
+      )
+      if (entries.length > 0) {
+        offlineDB
+          .saveHistory(entries)
+          .catch(err => console.error('Failed to cache chore history:', err))
+      }
+      return json
+    },
+    enabled: !!choreId,
+    staleTime: 0, // Always consider data stale
+    cacheTime: 0, // Don't cache the data
+    refetchOnMount: true, // Always refetch when component mounts
+    refetchOnWindowFocus: true, // Refetch when window gains focus
+  })
+}
+
+export const useUpdateChoreHistory = () => {
+  const queryClient = useQueryClient()
+
+  return useMutation({
+    mutationFn: async ({ choreId, historyData, historyId }) => {
+      const applyOptimisticUpdate = async () => {
+        queryClient.setQueryData(['choreHistory', choreId], oldData => {
+          if (!oldData?.res) return oldData
+          return {
+            ...oldData,
+            res: oldData.res.map(entry =>
+              entry.id === historyId
+                ? { ...entry, ...historyData, _pendingUpdate: true }
+                : entry,
+            ),
+          }
+        })
+        await offlineDB.updateHistoryEntry(choreId, historyId, {
+          ...historyData,
+          _pendingUpdate: true,
+        })
+        return { queued: true }
+      }
+
+      if (isOfflineFeatureEnabled() && !networkManager.isOnline) {
+        await commandQueue.enqueue(
+          CommandType.UPDATE_CHORE_HISTORY,
+          `${choreId}:${historyId}`,
+          { choreId, historyId, historyData },
+        )
+        return applyOptimisticUpdate()
+      }
+
+      try {
+        const response = await UpdateChoreHistory(
+          choreId,
+          historyId,
+          historyData,
+        )
+        if (!response || !response.ok) {
+          throw new Error('Failed to update chore history')
+        }
+        return response
+      } catch (error) {
+        if (isNetworkError(error)) {
+          await commandQueue.enqueue(
+            CommandType.UPDATE_CHORE_HISTORY,
+            `${choreId}:${historyId}`,
+            { choreId, historyId, historyData },
+          )
+          return applyOptimisticUpdate()
+        }
+        throw error
+      }
+    },
+    onSuccess: (data, { choreId }) => {
+      if (!data?.queued) {
+        queryClient.invalidateQueries({ queryKey: ['choreHistory', choreId] })
+      }
+      queryClient.invalidateQueries({ queryKey: ['pendingCommands'] })
+    },
+  })
+}
+
+export const useDeleteChoreHistory = () => {
+  const queryClient = useQueryClient()
+
+  return useMutation({
+    mutationFn: async ({ choreId, historyId }) => {
+      const applyOptimisticDelete = async () => {
+        queryClient.setQueryData(['choreHistory', choreId], oldData => {
+          if (!oldData?.res) return oldData
+          return {
+            ...oldData,
+            res: oldData.res.map(entry =>
+              entry.id === historyId
+                ? { ...entry, _pendingDelete: true }
+                : entry,
+            ),
+          }
+        })
+        await offlineDB.updateHistoryEntry(choreId, historyId, {
+          _pendingDelete: true,
+        })
+        return { queued: true }
+      }
+
+      if (isOfflineFeatureEnabled() && !networkManager.isOnline) {
+        await commandQueue.enqueue(
+          CommandType.DELETE_CHORE_HISTORY,
+          `${choreId}:${historyId}`,
+          { choreId, historyId },
+        )
+        return applyOptimisticDelete()
+      }
+
+      try {
+        const response = await DeleteChoreHistory(choreId, historyId)
+        if (!response || !response.ok) {
+          throw new Error('Failed to delete chore history')
+        }
+        return response
+      } catch (error) {
+        if (isNetworkError(error)) {
+          await commandQueue.enqueue(
+            CommandType.DELETE_CHORE_HISTORY,
+            `${choreId}:${historyId}`,
+            { choreId, historyId },
+          )
+          return applyOptimisticDelete()
+        }
+        throw error
+      }
+    },
+    onSuccess: (data, { choreId }) => {
+      if (!data?.queued) {
+        queryClient.invalidateQueries({ queryKey: ['choreHistory', choreId] })
+      }
+      queryClient.invalidateQueries({ queryKey: ['pendingCommands'] })
+    },
+  })
+}
+
+export const useMarkChoreComplete = () => {
+  const queryClient = useQueryClient()
+
+  return useMutation({
+    mutationFn: async ({ body, choreId, completedDate, performer }) => {
+      if (isOfflineFeatureEnabled() && !networkManager.isOnline) {
+        await commandQueue.enqueue(CommandType.COMPLETE_CHORE, choreId, {
+          id: choreId,
+          body,
+          completedDate,
+          performer,
+        })
+        await offlineDB.savePendingHistory({
+          id: -Date.now(),
+          choreId: Number(choreId),
+          completedBy: body?.completedBy || 0,
+          performedAt: completedDate || new Date().toISOString(),
+          notes: body?.note || null,
+          status: 1,
+          points: 0,
+          pending: true,
+        })
+        // Optimistically update the cache to show pending state
+        queryClient.setQueryData(['chores'], oldData => {
+          if (!oldData) return oldData
+          return {
+            res: oldData.res.map(chore =>
+              chore.id === choreId ? { ...chore, _pending: 'complete' } : chore,
+            ),
+          }
+        })
+        return { res: { _pending: 'complete' } }
+      }
+
+      const queueOfflineComplete = async () => {
+        await commandQueue.enqueue(CommandType.COMPLETE_CHORE, choreId, {
+          id: choreId,
+          body,
+          completedDate,
+          performer,
+        })
+        await offlineDB.savePendingHistory({
+          id: -Date.now(),
+          choreId: Number(choreId),
+          completedBy: body?.completedBy || 0,
+          performedAt: completedDate || new Date().toISOString(),
+          notes: body?.note || null,
+          status: 1,
+          points: 0,
+          pending: true,
+        })
+        queryClient.setQueryData(['chores'], oldData => {
+          if (!oldData) return oldData
+          return {
+            res: oldData.res.map(chore =>
+              chore.id === choreId ? { ...chore, _pending: 'complete' } : chore,
+            ),
+          }
+        })
+        return { res: { _pending: 'complete' } }
+      }
+
+      try {
+        return await MarkChoreComplete(choreId, body, completedDate, performer)
+      } catch (error) {
+        if (isNetworkError(error)) {
+          return queueOfflineComplete()
+        }
+        throw error
+      }
+    },
+    onSuccess: (_, { choreId }) => {
+      queryClient.invalidateQueries({ queryKey: ['chores'] })
+      queryClient.invalidateQueries({ queryKey: ['choreHistory', choreId] })
+      queryClient.invalidateQueries({ queryKey: ['choreDetails', choreId] })
+      queryClient.invalidateQueries({ queryKey: ['pendingCommands'] })
+    },
+  })
+}
+
+export const useSkipChore = () => {
+  const queryClient = useQueryClient()
+
+  return useMutation({
+    mutationFn: async choreId => {
+      if (isOfflineFeatureEnabled() && !networkManager.isOnline) {
+        await commandQueue.enqueue(CommandType.SKIP_CHORE, choreId, {
+          id: choreId,
+        })
+        // Optimistically update the cache to show pending state
+        queryClient.setQueryData(['chores'], oldData => {
+          if (!oldData) return oldData
+          return {
+            res: oldData.res.map(chore =>
+              chore.id === choreId ? { ...chore, _pending: 'skip' } : chore,
+            ),
+          }
+        })
+        return { res: { _pending: 'skip' } }
+      }
+
+      try {
+        return await SkipChore(choreId)
+      } catch (error) {
+        if (isNetworkError(error)) {
+          await commandQueue.enqueue(CommandType.SKIP_CHORE, choreId, {
+            id: choreId,
+          })
+          queryClient.setQueryData(['chores'], oldData => {
+            if (!oldData) return oldData
+            return {
+              res: oldData.res.map(chore =>
+                chore.id === choreId ? { ...chore, _pending: 'skip' } : chore,
+              ),
+            }
+          })
+          return { res: { _pending: 'skip' } }
+        }
+        throw error
+      }
+    },
+    onSuccess: (_, choreId) => {
+      queryClient.invalidateQueries({ queryKey: ['chores'] })
+      queryClient.invalidateQueries({ queryKey: ['choreHistory', choreId] })
+      queryClient.invalidateQueries({ queryKey: ['choreDetails', choreId] })
+      queryClient.invalidateQueries({ queryKey: ['pendingCommands'] })
+    },
+  })
+}
+
+export const useApproveChore = () => {
+  const queryClient = useQueryClient()
+
+  return useMutation({
+    mutationFn: ApproveChore,
+    onSuccess: (_, choreId) => {
+      queryClient.invalidateQueries({ queryKey: ['chores'] })
+      queryClient.invalidateQueries({ queryKey: ['choreHistory', choreId] })
+      queryClient.invalidateQueries({ queryKey: ['choreDetails', choreId] })
+    },
+  })
+}
+
+export const useRejectChore = () => {
+  const queryClient = useQueryClient()
+
+  return useMutation({
+    mutationFn: RejectChore,
+    onSuccess: (_, choreId) => {
+      queryClient.invalidateQueries({ queryKey: ['chores'] })
+      queryClient.invalidateQueries({ queryKey: ['choreHistory', choreId] })
+      queryClient.invalidateQueries({ queryKey: ['choreDetails', choreId] })
+    },
+  })
+}
+
+export const useChoreAttachments = (choreId, hasAttachments = true) => {
+  return useQuery({
+    queryKey: ['choreAttachments', choreId],
+    queryFn: async () => {
+      const response = await GetChoreAttachments(choreId)
+      if (response && response.ok) {
+        return await response.json()
+      }
+      throw new Error('Failed to fetch attachments')
+    },
+    enabled: !!choreId && hasAttachments,
+    staleTime: 10 * 60 * 1000,
+    gcTime: 15 * 60 * 1000,
+  })
+}

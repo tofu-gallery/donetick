@@ -1,0 +1,211 @@
+import { CreditCard, Person, Toll } from '@mui/icons-material'
+import {
+  Avatar,
+  Box,
+  Card,
+  Chip,
+  FormControl,
+  FormLabel,
+  IconButton,
+  Stack,
+  Typography,
+} from '@mui/joy'
+import { useEffect, useState } from 'react'
+import { useTranslation } from 'react-i18next'
+
+import ModalActions from '../../components/common/ModalActions.jsx'
+import NumberInput from '../../components/common/NumberInput.jsx'
+import { useResponsiveModal } from '../../hooks/useResponsiveModal.js'
+import { resolvePhotoURL } from '../../utils/Helpers.jsx'
+
+function RedeemPointsModal({ config }) {
+  const { t } = useTranslation('points')
+  const { ResponsiveModal } = useResponsiveModal()
+
+  const [points, setPoints] = useState(0)
+  const predefinedPoints = [1, 5, 10, 25, 50]
+
+  useEffect(() => {
+    setPoints(0)
+  }, [config])
+
+  const addPredefinedPoints = point => {
+    const newPoints = points + point
+    if (newPoints > config.available) {
+      setPoints(config.available)
+      return
+    }
+    setPoints(newPoints)
+  }
+
+  const canRedeem = points > 0 && points <= config.available
+
+  return (
+    <ResponsiveModal
+      open={config?.isOpen}
+      onClose={config?.onClose}
+      size='md'
+      title={t('redeem')}
+      footer={
+        <ModalActions
+          secondary={{ label: t('common:cancel'), onClick: config?.onClose }}
+          primary={{
+            label: t('redeemModal.redeemButton'),
+            startDecorator: <CreditCard />,
+            disabled: !canRedeem,
+            onClick: () =>
+              config?.onSave({
+                points: Number(points),
+                userId: config?.user?.userId,
+              }),
+          }}
+        />
+      }
+    >
+      <Stack spacing={2}>
+        {/* User Info Card */}
+        <Card
+          variant='soft'
+          sx={{
+            p: 2,
+          }}
+        >
+          <Stack direction='row' spacing={2} alignItems='center'>
+            <Avatar
+              size='md'
+              src={resolvePhotoURL(config?.user?.image)}
+              sx={{
+                border: '2px solid',
+                borderColor: 'warning.200',
+              }}
+            >
+              <Person />
+            </Avatar>
+            <Box sx={{ flex: 1 }}>
+              <Typography level='title-sm' sx={{ fontWeight: 600 }}>
+                {config?.user?.displayName || 'User'}
+              </Typography>
+              <Chip
+                size='sm'
+                variant='soft'
+                color='success'
+                startDecorator={<Toll />}
+                sx={{ mt: 0.5 }}
+              >
+                {t('redeemModal.pointsAvailable', {
+                  count: config?.available || 0,
+                })}
+              </Chip>
+            </Box>
+          </Stack>
+        </Card>
+
+        {/* Points Input Section */}
+        <FormControl>
+          <FormLabel sx={{ fontWeight: 600, mb: 1 }}>
+            {t('redeemModal.pointsToRedeem')}
+          </FormLabel>
+          <NumberInput
+            value={points}
+            min={0}
+            max={config?.available || 0}
+            size='lg'
+            variant='outlined'
+            startDecorator={<Toll />}
+            placeholder={t('redeemModal.placeholder')}
+            onValueChange={setPoints}
+            sx={{
+              '--Input-decoratorChildHeight': '45px',
+              fontSize: 'lg',
+              fontWeight: 500,
+              '&:focus-within': {
+                borderColor: 'warning.500',
+                boxShadow: '0 0 0 2px rgba(255, 193, 7, 0.2)',
+              },
+            }}
+          />
+          {points > config?.available && (
+            <Typography level='body-xs' sx={{ color: 'danger.500', mt: 0.5 }}>
+              {t('redeemModal.cannotExceed')}
+            </Typography>
+          )}
+        </FormControl>
+
+        {/* Quick Selection Buttons */}
+        <Box>
+          <Typography level='body-sm' sx={{ fontWeight: 600, mb: 1.5 }}>
+            {t('redeemModal.quickAdd')}
+          </Typography>
+          <Stack
+            direction='row'
+            spacing={1}
+            justifyContent='center'
+            flexWrap='wrap'
+            useFlexGap
+          >
+            {predefinedPoints.map(point => (
+              <IconButton
+                key={point}
+                aria-label={`Add ${point} points`}
+                variant='outlined'
+                disabled={points + point > config?.available}
+                onClick={() => addPredefinedPoints(point)}
+                sx={{
+                  borderRadius: '50%',
+                  minWidth: 45,
+                  minHeight: 45,
+                  fontWeight: 600,
+                  fontSize: 'sm',
+                  '&:hover:not(:disabled)': {
+                    transform: 'scale(1.05)',
+                    boxShadow: 'sm',
+                  },
+                  '&:disabled': {
+                    opacity: 0.3,
+                  },
+                  transition: 'all 0.2s ease',
+                }}
+              >
+                +{point}
+              </IconButton>
+            ))}
+          </Stack>
+        </Box>
+
+        {/* Summary Section */}
+        {points > 0 && (
+          <Card
+            variant='soft'
+            color='primary'
+            sx={{
+              p: 2,
+              textAlign: 'center',
+              background:
+                'linear-gradient(135deg, rgba(25,118,210,0.1) 0%, rgba(25,118,210,0.05) 100%)',
+            }}
+          >
+            <Typography level='body-sm' sx={{ color: 'text.secondary' }}>
+              {t('redeemModal.aboutToRedeem')}
+            </Typography>
+            <Typography
+              level='h4'
+              sx={{ color: 'primary.600', fontWeight: 700 }}
+            >
+              {t('redeemModal.amount', { count: points })}
+            </Typography>
+            <Typography
+              level='body-xs'
+              sx={{ color: 'text.secondary', mt: 0.5 }}
+            >
+              {t('redeemModal.remaining', {
+                count: (config?.available || 0) - points,
+              })}
+            </Typography>
+          </Card>
+        )}
+      </Stack>
+    </ResponsiveModal>
+  )
+}
+
+export default RedeemPointsModal

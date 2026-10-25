@@ -1,0 +1,173 @@
+import {
+  Alert,
+  Box,
+  FormControl,
+  FormLabel,
+  Switch,
+  Textarea,
+  Typography,
+} from '@mui/joy'
+import { useCallback, useEffect, useState } from 'react'
+import { useTranslation } from 'react-i18next'
+
+import KeyboardShortcutHint from '../../../components/common/KeyboardShortcutHint'
+import ModalActions from '../../../components/common/ModalActions'
+import { useResponsiveModal } from '../../../hooks/useResponsiveModal'
+import { isOfficialDonetickInstanceSync } from '../../../utils/FeatureToggle'
+
+function NudgeModal({ config }) {
+  const { t } = useTranslation('chores')
+  const { ResponsiveModal } = useResponsiveModal()
+  const [showKeyboardShortcuts, setShowKeyboardShortcuts] = useState(false)
+  const [message, setMessage] = useState('')
+  const [notifyAllAssignees, setNotifyAllAssignees] = useState(false)
+  const [isOfficialInstance, setIsOfficialInstance] = useState(false)
+
+  const handleAction = useCallback(
+    isConfirmed => {
+      if (isConfirmed) {
+        config.onConfirm({
+          choreId: config.choreId,
+          message,
+          notifyAllAssignees,
+        })
+      } else {
+        config.onClose()
+      }
+    },
+    [config, message, notifyAllAssignees],
+  )
+
+  // Reset form when modal opens
+  useEffect(() => {
+    if (config?.isOpen) {
+      setMessage('')
+      setNotifyAllAssignees(false)
+
+      // Check if this is the official donetick.com instance
+      try {
+        setIsOfficialInstance(isOfficialDonetickInstanceSync())
+      } catch (error) {
+        console.warn('Error checking instance type:', error)
+        setIsOfficialInstance(false)
+      }
+    }
+  }, [config?.isOpen])
+
+  // Keyboard shortcuts for nudge modal
+  useEffect(() => {
+    const handleKeyDown = event => {
+      if (!config?.isOpen) return
+
+      // Show keyboard shortcuts when Ctrl/Cmd is pressed
+      if (event.ctrlKey || event.metaKey) {
+        setShowKeyboardShortcuts(true)
+      }
+
+      // Ctrl/Cmd + Y for confirm
+      if ((event.ctrlKey || event.metaKey) && event.key === 'y') {
+        event.preventDefault()
+        handleAction(true)
+        return
+      }
+
+      // Ctrl/Cmd + X for cancel
+      if ((event.ctrlKey || event.metaKey) && event.key === 'x') {
+        event.preventDefault()
+        handleAction(false)
+        return
+      }
+
+      // Escape key for cancel
+      if (event.key === 'Escape') {
+        event.preventDefault()
+        handleAction(false)
+        return
+      }
+    }
+
+    const handleKeyUp = event => {
+      if (!event.ctrlKey && !event.metaKey) {
+        setShowKeyboardShortcuts(false)
+      }
+    }
+
+    if (config?.isOpen) {
+      document.addEventListener('keydown', handleKeyDown)
+      document.addEventListener('keyup', handleKeyUp)
+    }
+
+    return () => {
+      document.removeEventListener('keydown', handleKeyDown)
+      document.removeEventListener('keyup', handleKeyUp)
+    }
+  }, [config?.isOpen, handleAction])
+
+  return (
+    <ResponsiveModal
+      open={config?.isOpen}
+      onClose={config?.onClose}
+      size='lg'
+      fullWidth={true}
+      unmountDelay={250}
+      title={t('nudge.title')}
+      description={t('nudge.description')}
+      footer={
+        <ModalActions
+          secondary={{
+            label: t('choreView.cancel'),
+            onClick: () => handleAction(false),
+            endDecorator: showKeyboardShortcuts ? (
+              <KeyboardShortcutHint shortcut='X' />
+            ) : undefined,
+          }}
+          primary={{
+            label: t('nudge.title'),
+            onClick: () => handleAction(true),
+            disabled: !isOfficialInstance,
+            endDecorator: showKeyboardShortcuts ? (
+              <KeyboardShortcutHint shortcut='Y' />
+            ) : undefined,
+          }}
+        />
+      }
+    >
+      {!isOfficialInstance && (
+        <Alert color='warning' sx={{ mb: 2 }}>
+          <Typography level='body-sm'>
+            <strong>{t('nudge.selfHostedHeading')}</strong>{' '}
+            {t('nudge.selfHostedNotice')}
+            <br />
+            {t('nudge.selfHostedFollowUp')}
+          </Typography>
+        </Alert>
+      )}
+
+      <FormControl mb={2}>
+        <FormLabel>{t('nudge.customMessage')}</FormLabel>
+        <Textarea
+          placeholder={t('nudge.messagePlaceholder')}
+          value={message}
+          onChange={e => setMessage(e.target.value)}
+          minRows={3}
+          maxRows={5}
+        />
+      </FormControl>
+
+      <FormControl orientation='horizontal' sx={{ mb: 3 }}>
+        <Box sx={{ flex: 1 }}>
+          <FormLabel>{t('nudge.notifyAll')}</FormLabel>
+          <Typography level='body-sm' color='text.secondary'>
+            {t('nudge.notifyAllHint')}
+          </Typography>
+        </Box>
+        <Switch
+          checked={notifyAllAssignees}
+          onChange={e => setNotifyAllAssignees(e.target.checked)}
+        />
+      </FormControl>
+    </ResponsiveModal>
+  )
+}
+
+export default NudgeModal

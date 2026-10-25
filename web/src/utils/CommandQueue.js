@@ -1,0 +1,327 @@
+import { offlineDB } from './OfflineDB'
+import { isOfflineFeatureEnabled } from './OfflineFeatureToggle'
+
+// Domain command types
+export const CommandType = {
+  CREATE_CHORE: 'create_chore',
+  UPDATE_CHORE: 'update_chore',
+  UPDATE_CHORE_HISTORY: 'update_chore_history',
+  COMPLETE_CHORE: 'complete_chore',
+  SKIP_CHORE: 'skip_chore',
+  START_CHORE: 'start_chore',
+  PAUSE_CHORE: 'pause_chore',
+  DELETE_CHORE: 'delete_chore',
+  DELETE_CHORE_HISTORY: 'delete_chore_history',
+  RESCHEDULE_CHORE: 'reschedule_chore',
+  ARCHIVE_CHORE: 'archive_chore',
+  UNARCHIVE_CHORE: 'unarchive_chore',
+}
+
+// Parse a stored command payload; a corrupt payload must not take down every
+// consumer of the queue, so parse failures surface as null payloads.
+const parsePayload = command => {
+  try {
+    return { ...command, payload: JSON.parse(command.payload) }
+  } catch {
+    console.warn('Skipping corrupt command payload', command.id)
+    return null
+  }
+}
+
+class CommandQueue {
+  _sanitizeCreatePayload(payload = {}) {
+    const sanitized = { ...payload }
+    delete sanitized.id
+    delete sanitized._pendingCreate
+    delete sanitized._pendingUpdate
+    return sanitized
+  }
+
+  _clearPendingFlags(chore = {}) {
+    const next = { ...chore }
+    delete next._pending
+    delete next._pendingUpdate
+    return next
+  }
+
+  async _rollbackCancelledCommand(command) {
+    if (!command) return
+
+    if (
+      command.commandType !== CommandType.ARCHIVE_CHORE &&
+      command.commandType !== CommandType.UNARCHIVE_CHORE
+    ) {
+      return
+    }
+
+    const cachedChore = await offlineDB.getChore(command.entityId)
+    if (!cachedChore) return
+
+    const restoredChore = this._clearPendingFlags({
+      ...cachedChore,
+      isActive: command.commandType === CommandType.ARCHIVE_CHORE,
+    })
+
+    await offlineDB.saveChores([restoredChore])
+  }
+
+  // Enqueue a domain command
+  async enqueue(type, entityId, payload) {
+    if (!isOfflineFeatureEnabled()) {
+      throw new Error('Offline support is disabled on this device')
+    }
+
+    const command = {
+      commandType: type,
+      entityId: String(entityId),
+      payload: JSON.stringify(payload),
+      createdAt: Date.now(),
+      status: 'pending',
+      error: null,
+    }
+    return offlineDB.enqueueCommand(command)
+  }
+
+  // Get all pending commands in order
+  async getPending() {
+    if (!isOfflineFeatureEnabled()) return []
+    const commands = await offlineDB.getCommands()
+    return commands
+      .filter(c => c.status === 'pending' || c.status === 'syncing')
+      .map(parsePayload)
+      .filter(Boolean)
+  }
+
+  // Get all failed commands
+  async getFailed() {
+    if (!isOfflineFeatureEnabled()) return []
+    const commands = await offlineDB.getCommands()
+    return commands
+      .filter(c => c.status === 'failed')
+      .map(parsePayload)
+      .filter(Boolean)
+  }
+
+  // Get pending commands for a specific entity (for undo/UI)
+  async getPendingForEntity(entityId) {
+    if (!isOfflineFeatureEnabled()) return []
+    const allCommands = await offlineDB.getCommands()
+    const key = String(entityId)
+    const commands = allCommands
+      .filter(
+        c =>
+          c.entityId === key ||
+          (typeof c.entityId === 'string' && c.entityId.startsWith(`${key}:`)),
+      )
+      .sort((a, b) => a.createdAt - b.createdAt)
+    return commands
+      .filter(c => c.status === 'pending' || c.status === 'syncing')
+      .map(parsePayload)
+      .filter(Boolean)
+  }
+
+  // Same as getPendingForEntity, but for every entity at once, keyed by entity
+  // id. Lets a list of cards share a single read of the store instead of each
+  // card reading it for itself.
+  async getPendingGroupedByEntity() {
+    if (!isOfflineFeatureEnabled()) return {}
+    const allCommands = await offlineDB.getCommands()
+    const grouped = {}
+    allCommands
+      .filter(c => c.status === 'pending' || c.status === 'syncing')
+      .sort((a, b) => a.createdAt - b.createdAt)
+      .forEach(c => {
+        const command = parsePayload(c)
+        if (!command) return
+        // Commands can be scoped to a sub-entity ("<choreId>:<something>");
+        // those belong to the parent, matching getPendingForEntity.
+        const key = String(c.entityId ?? '').split(':')[0]
+        if (!key) return
+        grouped[key] = grouped[key] || []
+        grouped[key].push(command)
+      })
+    return grouped
+  }
+
+  // Cancel/undo a pending command
+  async cancel(commandId) {
+    if (!isOfflineFeatureEnabled()) return
+
+    const allCommands = await offlineDB.getCommands()
+    const command = allCommands.find(c => String(c.id) === String(commandId))
+
+    await this._rollbackCancelledCommand(command)
+    return offlineDB.removeCommand(commandId)
+  }
+
+  // Rewrite queued commands after an offline-created entity gets its real
+  // server id: commands queued against the temp id (complete, skip, history
+  // edits, …) would otherwise replay against an id the server doesn't know.
+  async remapEntityId(tempId, realId) {
+    if (!isOfflineFeatureEnabled()) return
+    const tempKey = String(tempId)
+    const realKey = String(realId)
+    const commands = await offlineDB.getCommands()
+
+    for (const cmd of commands) {
+      const entityId = String(cmd.entityId)
+      const matches = entityId === tempKey || entityId.startsWith(`${tempKey}:`)
+      if (!matches) continue
+
+      const newEntityId =
+        entityId === tempKey
+          ? realKey
+          : `${realKey}:${entityId.slice(tempKey.length + 1)}`
+
+      let newPayload = cmd.payload
+      try {
+        const parsed = JSON.parse(cmd.payload)
+        if (parsed && typeof parsed === 'object') {
+          if (String(parsed.id) === tempKey) parsed.id = realId
+          if (String(parsed.choreId) === tempKey) parsed.choreId = realId
+          newPayload = JSON.stringify(parsed)
+        }
+      } catch {
+        // unparseable payload — remap the entity id only
+      }
+
+      await offlineDB.updateCommand(cmd.id, {
+        entityId: newEntityId,
+        payload: newPayload,
+      })
+    }
+  }
+
+  // Track a transient failure so replay can give up after repeated attempts
+  async incrementRetry(commandId) {
+    if (!isOfflineFeatureEnabled()) return
+    return offlineDB.incrementCommandRetry(commandId)
+  }
+
+  // Mark as syncing
+  async markSyncing(commandId) {
+    if (!isOfflineFeatureEnabled()) return
+    return offlineDB.updateCommandStatus(commandId, 'syncing', null)
+  }
+
+  // Mark as failed (only for unrecoverable errors like conflicts)
+  async markFailed(commandId, error) {
+    if (!isOfflineFeatureEnabled()) return
+    return offlineDB.updateCommandStatus(commandId, 'failed', error)
+  }
+
+  // Reset back to pending (for transient network/server errors so it retries)
+  async resetPending(commandId) {
+    if (!isOfflineFeatureEnabled()) return
+    return offlineDB.updateCommandStatus(commandId, 'pending', null)
+  }
+
+  // Reset any in-flight commands so they remain retryable after aborted syncs
+  async resetSyncing() {
+    if (!isOfflineFeatureEnabled()) return
+    const commands = await offlineDB.getCommands()
+    const syncingCommands = commands.filter(c => c.status === 'syncing')
+
+    await Promise.all(
+      syncingCommands.map(cmd =>
+        offlineDB.updateCommandStatus(cmd.id, 'pending', null),
+      ),
+    )
+  }
+
+  // Remove after successful sync
+  async markDone(commandId) {
+    if (!isOfflineFeatureEnabled()) return
+    return offlineDB.removeCommand(commandId)
+  }
+
+  // Compact: merge consecutive updates to same entity
+  async compact() {
+    if (!isOfflineFeatureEnabled()) return
+    const pending = await this.getPending()
+    const seen = new Map() // entityId -> last command
+    const toRemove = []
+
+    for (const cmd of pending) {
+      const prev = seen.get(cmd.entityId)
+
+      if (prev?.commandType === CommandType.CREATE_CHORE) {
+        if (cmd.commandType === CommandType.UPDATE_CHORE) {
+          const mergedPayload = this._sanitizeCreatePayload({
+            ...prev.payload,
+            ...cmd.payload,
+          })
+          await offlineDB.updateCommand(prev.id, {
+            payload: JSON.stringify(mergedPayload),
+          })
+          toRemove.push(cmd.id)
+          continue
+        }
+
+        if (cmd.commandType === CommandType.RESCHEDULE_CHORE) {
+          const mergedPayload = this._sanitizeCreatePayload({
+            ...prev.payload,
+            dueDate: cmd.payload?.dueDate ?? prev.payload?.dueDate,
+            nextDueDate: cmd.payload?.dueDate ?? prev.payload?.nextDueDate,
+          })
+          await offlineDB.updateCommand(prev.id, {
+            payload: JSON.stringify(mergedPayload),
+          })
+          toRemove.push(cmd.id)
+          continue
+        }
+
+        if (cmd.commandType === CommandType.ARCHIVE_CHORE) {
+          const mergedPayload = this._sanitizeCreatePayload({
+            ...prev.payload,
+            isActive: false,
+          })
+          await offlineDB.updateCommand(prev.id, {
+            payload: JSON.stringify(mergedPayload),
+          })
+          toRemove.push(cmd.id)
+          continue
+        }
+
+        if (cmd.commandType === CommandType.UNARCHIVE_CHORE) {
+          const mergedPayload = this._sanitizeCreatePayload({
+            ...prev.payload,
+            isActive: true,
+          })
+          await offlineDB.updateCommand(prev.id, {
+            payload: JSON.stringify(mergedPayload),
+          })
+          toRemove.push(cmd.id)
+          continue
+        }
+
+        if (cmd.commandType === CommandType.DELETE_CHORE) {
+          toRemove.push(prev.id, cmd.id)
+          seen.delete(cmd.entityId)
+          continue
+        }
+      }
+
+      if (cmd.commandType === CommandType.UPDATE_CHORE) {
+        if (prev && prev.commandType === CommandType.UPDATE_CHORE) {
+          // Merge: keep latest payload, remove older
+          toRemove.push(prev.id)
+        }
+      }
+
+      if (cmd.commandType === CommandType.DELETE_CHORE) {
+        if (prev?.commandType === CommandType.UPDATE_CHORE) {
+          toRemove.push(prev.id)
+        }
+      }
+
+      seen.set(cmd.entityId, cmd)
+    }
+
+    for (const id of [...new Set(toRemove)]) {
+      await offlineDB.removeCommand(id)
+    }
+  }
+}
+
+export const commandQueue = new CommandQueue()
