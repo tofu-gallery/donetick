@@ -1,0 +1,5 @@
+# Tofu (2026-10-25): this file is Tofu's addition; it is not part of upstream Donetick.
+# The image installs and builds the web app itself (see Dockerfile), so a local install or
+# build in web/ never goes into the build context.
+web/node_modules
+web/dist
