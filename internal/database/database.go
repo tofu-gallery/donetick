@@ -59,6 +59,15 @@ func NewDatabase(cfg *config.Config) (*gorm.DB, error) {
 	switch cfg.Database.Type {
 	case "postgres":
 		dsn := fmt.Sprintf("host=%s port=%v user=%s password=%s dbname=%s sslmode=disable TimeZone=Asia/Shanghai", cfg.Database.Host, cfg.Database.Port, cfg.Database.User, cfg.Database.Password, cfg.Database.Name)
+		// Tofu (2026-10-25): when the host hands the database over as DATABASE_URL and
+		// DT_DATABASE_HOST is not set, connect with that URL instead of the fields above.
+		// The URL keeps its own sslmode (Tofu's database takes TLS connections, which the
+		// line above turns off), and poolerSafeDSN makes every query run on the unnamed
+		// statement, because Tofu's DATABASE_URL goes through a transaction pooler that
+		// keeps no named prepared statements, which are what pgx uses by default.
+		if databaseURL := os.Getenv("DATABASE_URL"); databaseURL != "" && os.Getenv("DT_DATABASE_HOST") == "" {
+			dsn = poolerSafeDSN(databaseURL)
+		}
 		for i := 0; i <= 30; i++ {
 			db, err = gorm.Open(postgres.Open(dsn), &gormConfig)
 			if err == nil {
@@ -87,4 +96,23 @@ func NewDatabase(cfg *config.Config) (*gorm.DB, error) {
 	}
 
 	return db, nil
+}
+
+// Tofu (2026-10-25): see NewDatabase. Adds default_query_exec_mode=cache_describe
+// to a connection string that names no query exec mode of its own: pgx then caches
+// each statement's description and runs it on the unnamed statement, which a
+// transaction pooler (PgBouncer, Supavisor) can serve. A postgres:// URL takes it as
+// a query parameter, a key=value string as one more pair.
+func poolerSafeDSN(dsn string) string {
+	if strings.Contains(dsn, "default_query_exec_mode=") {
+		return dsn
+	}
+	if strings.HasPrefix(dsn, "postgres://") || strings.HasPrefix(dsn, "postgresql://") {
+		separator := "?"
+		if strings.Contains(dsn, "?") {
+			separator = "&"
+		}
+		return dsn + separator + "default_query_exec_mode=cache_describe"
+	}
+	return dsn + " default_query_exec_mode=cache_describe"
 }
