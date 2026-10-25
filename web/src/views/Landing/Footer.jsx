@@ -14,9 +14,12 @@ import LogoSVG from '@/assets/logo.svg'
 import { version } from '../../../package.json'
 import DiscordIcon from '../../components/icons/DiscordIcon'
 import RedditIcon from '../../components/icons/RedditIcon'
+// Tofu (2026-10-25): the source code address, see SourceCodeLink.jsx.
+import { useSourceUrl } from '../../components/SourceCodeLink'
 
 const Footer = () => {
   const currentYear = new Date().getFullYear()
+  const sourceUrl = useSourceUrl() // Tofu (2026-10-25)
 
   const footerLinks = {
     product: [
@@ -49,7 +52,8 @@ const Footer = () => {
         label: 'Home Assistant',
         href: 'https://github.com/donetick/hassio-addons',
       },
-      { label: 'Source Code', href: 'https://github.com/donetick/donetick' },
+      // Tofu (2026-10-25): this copy's own source code (AGPL-3.0 section 13).
+      { label: 'Source Code', href: sourceUrl },
     ],
     legal: [
       { label: 'Privacy Policy', href: '/privacy' },
@@ -68,7 +72,8 @@ const Footer = () => {
   const socialLinks = [
     {
       icon: <GitHub />,
-      href: 'https://github.com/donetick/donetick',
+      // Tofu (2026-10-25): this copy's own source code (AGPL-3.0 section 13).
+      href: sourceUrl,
       label: 'GitHub',
     },
     {

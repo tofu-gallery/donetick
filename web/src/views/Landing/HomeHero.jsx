@@ -11,9 +11,12 @@ import Logo from '@/assets/logo.svg'
 import screenShotMyChore from '@/assets/screenshot-my-chore.png'
 import screenShotMyChoreDark from '@/assets/screenshot-my-chore-dark.png'
 
+// Tofu (2026-10-25): the source code address, see SourceCodeLink.jsx.
+import { useSourceUrl } from '../../components/SourceCodeLink'
 import useWindowWidth from '../../hooks/useWindowWidth'
 
 const HomeHero = () => {
+  const sourceUrl = useSourceUrl() // Tofu (2026-10-25)
   const navigate = useNavigate()
   const windowWidth = useWindowWidth()
   const windowThreshold = 600
@@ -156,8 +159,9 @@ const HomeHero = () => {
               }}
               className='hover:scale-105'
               onClick={() => {
-                // new window open to https://github.com/Donetick:
-                window.open('https://github.com/donetick/donetick', '_blank')
+                // Tofu (2026-10-25): opens this copy's own source code (AGPL-3.0
+                // section 13) instead of upstream's repository.
+                window.open(sourceUrl, '_blank')
               }}
               startDecorator={<GitHub />}
             >
