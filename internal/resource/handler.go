@@ -18,6 +18,10 @@ type Resource struct {
 	// signup, leaving only SSO (#438).
 	DisablePasswordAuth bool `json:"disable_password_auth"`
 	BridgeEnabled       bool `json:"bridge_enabled"`
+	// Tofu (2026-10-25): where this server's source code is (the source_url
+	// setting, DT_SOURCE_URL), for the web app's "Source code" link (AGPL-3.0
+	// section 13). Left out when it is not set.
+	SourceURL string `json:"source_url,omitempty"`
 }
 type identityProvider struct {
 	Auth_url  string   `json:"auth_url" binding:"omitempty"`
@@ -53,6 +57,7 @@ func (h *Handler) getResource(c *gin.Context) {
 		SingleCircleInstance:   h.config.SingleCircleInstance,
 		DisablePasswordAuth:    h.config.DisablePasswordAuth,
 		BridgeEnabled:          h.config.Bridge.Enabled,
+		SourceURL:              h.config.SourceURL, // Tofu (2026-10-25)
 	})
 }
 

@@ -36,6 +36,8 @@ import { useLocation, useNavigate, useSearchParams } from 'react-router-dom'
 
 import { version } from '../../../package.json'
 import DoneTickLogo from '../../assets/logo.svg'
+// Tofu (2026-10-25): the source code link, see SourceCodeLink.jsx.
+import SourceCodeLink from '../../components/SourceCodeLink'
 import UserProfileAvatar from '../../components/UserProfileAvatar'
 import { useNavBarTitleContext } from '../../contexts/NavBarTitleContext'
 import { useScrollDirection } from '../../hooks/useScrollDirection'
@@ -395,6 +397,13 @@ const NavBar = () => {
             version,
             apiVersion: resource?.api_version || t('apiVersionUnavailable'),
           })}
+        </Typography>
+      )}
+      {/* Tofu (2026-10-25): signed-in pages link to this copy's own source code
+          too (AGPL-3.0 section 13), under the version line. */}
+      {!compact && (
+        <Typography level='body-xs' sx={{ px: 1, pb: 0.75 }}>
+          <SourceCodeLink sx={{ color: 'text.tertiary' }} />
         </Typography>
       )}
     </Box>

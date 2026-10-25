@@ -50,7 +50,11 @@ type Config struct {
 	Storage                StorageConfig       `mapstructure:"storage" yaml:"storage"`
 	SingleCircleInstance   bool                `mapstructure:"single_circle_instance" yaml:"single_circle_instance"`
 	DisablePasswordAuth    bool                `mapstructure:"disable_password_auth" yaml:"disable_password_auth"`
-	Info                   Info
+	// Tofu (2026-10-25): the address of this server's own source code, returned by
+	// /api/v1/resource as source_url so the web app can link to it (AGPL-3.0
+	// section 13). Set it with DT_SOURCE_URL; empty by default.
+	SourceURL string `mapstructure:"source_url" yaml:"source_url"`
+	Info      Info
 }
 
 type Info struct {

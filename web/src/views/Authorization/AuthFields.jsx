@@ -14,6 +14,8 @@ import {
 import { useState } from 'react'
 import { useTranslation } from 'react-i18next'
 
+// Tofu (2026-10-25): the source code link, see SourceCodeLink.jsx.
+import SourceCodeLink from '../../components/SourceCodeLink'
 import { authButtonSx, authInputSx } from './authStyles'
 
 const labelSx = { fontSize: '0.875rem', fontWeight: 600, mb: 0.75 }
@@ -165,6 +167,10 @@ export const LegalLinks = () => {
       >
         {t('termsOfUse')}
       </Link>
+      {/* Tofu (2026-10-25): every sign-in, sign-up and password page links to
+          this copy's own source code (AGPL-3.0 section 13). */}
+      {' · '}
+      <SourceCodeLink />
     </Typography>
   )
 }
