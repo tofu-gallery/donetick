@@ -51,6 +51,8 @@ import { useNotification } from '../../service/NotificationProvider'
 import { apiClient } from '../../utils/ApiClient'
 import { isPlusAccount, resolvePhotoURL } from '../../utils/Helpers'
 import { patchDescriptionHtml } from '../../utils/ImageCache'
+// Tofu (2026-10-25): see libURL in handleImageUpload
+import { imageCompressionLibURL } from '../../utils/ImageCompressionLib'
 // Tofu (2026-10-25): see the 503 check in handleImageUpload
 import { uploadsNotSetUpError } from '../../utils/UploadsNotSetUp'
 
@@ -119,6 +121,8 @@ const RichTextEditor = forwardRef(
             maxSizeMB: entityType === 'profile' ? 0.5 : 1, // Smaller size for profile images
             maxWidthOrHeight: entityType === 'profile' ? 320 : 1200, // Smaller dimensions for profile images
             useWebWorker: true,
+            // Tofu (2026-10-25): the worker's script from this app, not cdn.jsdelivr.net
+            libURL: imageCompressionLibURL,
             fileType: 'image/jpeg',
           }
 

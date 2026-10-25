@@ -29,6 +29,8 @@ import { useNotification } from '../../service/NotificationProvider'
 import { apiClient } from '../../utils/ApiClient'
 import { UpdateUserDetails } from '../../utils/Fetcher'
 import { resolvePhotoURL } from '../../utils/Helpers'
+// Tofu (2026-10-25): see libURL in handleCropSave
+import { imageCompressionLibURL } from '../../utils/ImageCompressionLib'
 import { getCroppedImg } from '../../utils/imageCropUtils'
 // Tofu (2026-10-25): see the 503 check in handleCropSave
 import { uploadsNotSetUpError } from '../../utils/UploadsNotSetUp'
@@ -99,6 +101,8 @@ const ProfileContent = ({ refetchUserProfile, userProfile }) => {
         maxSizeMB: 0.02,
         maxWidthOrHeight: 160,
         useWebWorker: true,
+        // Tofu (2026-10-25): the worker's script from this app, not cdn.jsdelivr.net
+        libURL: imageCompressionLibURL,
         fileType: 'image/jpeg',
         initialQuality: 0.8,
       })

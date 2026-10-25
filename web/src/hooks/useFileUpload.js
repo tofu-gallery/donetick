@@ -7,6 +7,8 @@ import { useUserProfile } from '../queries/UserQueries'
 import { useNotification } from '../service/NotificationProvider'
 import { apiClient } from '../utils/ApiClient'
 import { isPlusAccount, resolvePhotoURL } from '../utils/Helpers'
+// Tofu (2026-10-25): see libURL below
+import { imageCompressionLibURL } from '../utils/ImageCompressionLib'
 // Tofu (2026-10-25): see the 503 check below
 import { uploadsNotSetUpError } from '../utils/UploadsNotSetUp'
 
@@ -38,6 +40,8 @@ export const useFileUpload = ({
             maxSizeMB: entityType === 'profile' ? 0.5 : 1,
             maxWidthOrHeight: entityType === 'profile' ? 320 : 1200,
             useWebWorker: true,
+            // Tofu (2026-10-25): the worker's script from this app, not cdn.jsdelivr.net
+            libURL: imageCompressionLibURL,
             fileType: 'image/jpeg',
           }
 
