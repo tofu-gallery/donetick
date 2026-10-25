@@ -30,6 +30,8 @@ import { apiClient } from '../../utils/ApiClient'
 import { UpdateUserDetails } from '../../utils/Fetcher'
 import { resolvePhotoURL } from '../../utils/Helpers'
 import { getCroppedImg } from '../../utils/imageCropUtils'
+// Tofu (2026-10-25): see the 503 check in handleCropSave
+import { uploadsNotSetUpError } from '../../utils/UploadsNotSetUp'
 import LoadingComponent from '../components/Loading'
 import SettingsLayout from './SettingsLayout'
 
@@ -104,6 +106,13 @@ const ProfileContent = ({ refetchUserProfile, userProfile }) => {
       const formData = new FormData()
       formData.append('file', compressedFile, 'profile.jpg')
       const response = await apiClient.upload('/users/profile_photo', formData)
+      // Tofu (2026-10-25): a copy whose owner has not added a storage bucket answers
+      // 503 with a sentence saying so; show it (utils/UploadsNotSetUp.js).
+      const notSetUp = await uploadsNotSetUpError(response)
+      if (notSetUp) {
+        showError(notSetUp)
+        return
+      }
       if (!response.ok) throw new Error('Upload failed')
       await response.json()
       await refetchUserProfile()

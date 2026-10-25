@@ -51,6 +51,8 @@ import { useNotification } from '../../service/NotificationProvider'
 import { apiClient } from '../../utils/ApiClient'
 import { isPlusAccount, resolvePhotoURL } from '../../utils/Helpers'
 import { patchDescriptionHtml } from '../../utils/ImageCache'
+// Tofu (2026-10-25): see the 503 check in handleImageUpload
+import { uploadsNotSetUpError } from '../../utils/UploadsNotSetUp'
 
 const RichTextEditor = forwardRef(
   (
@@ -156,6 +158,14 @@ const RichTextEditor = forwardRef(
           }
 
           const response = await apiClient.upload('/assets/chore', formData)
+
+          // Tofu (2026-10-25): a copy whose owner has not added a storage bucket
+          // answers 503 with a sentence saying so; show it (utils/UploadsNotSetUp.js).
+          const notSetUp = await uploadsNotSetUpError(response)
+          if (notSetUp) {
+            showError(notSetUp)
+            return
+          }
 
           if (response.status === 507) {
             showError({

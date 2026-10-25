@@ -113,6 +113,13 @@ func (h *Handler) AssetHandler(c *gin.Context) {
 }
 
 func (h *Handler) ChoreUploadHandler(c *gin.Context) {
+	// Tofu (2026-10-25): until the owner adds a storage bucket, say so in one plain
+	// sentence instead of failing with a misleading error (uploads_set_up.go, TOFU.md).
+	// The route is behind the sign-in check, so only signed-in people get here.
+	if !UploadsSetUp(h.storage, false) {
+		RefuseUploadsNotSetUp(c)
+		return
+	}
 	// read chore from formdata chore and the file from file:
 	log := logging.FromContext(c)
 	currentUser, ok := auth.CurrentUser(c)

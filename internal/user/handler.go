@@ -1278,6 +1278,14 @@ func (h *Handler) setWebhook(c *gin.Context) {
 }
 
 func (h *Handler) updateProfilePhoto(c *gin.Context) {
+	// Tofu (2026-10-25): until the owner adds a storage bucket, say so in one plain
+	// sentence instead of failing with a misleading error
+	// (internal/storage/uploads_set_up.go, TOFU.md). The route is behind the sign-in
+	// check, so only signed-in people get here.
+	if !storage.UploadsSetUp(h.storage, true) {
+		storage.RefuseUploadsNotSetUp(c)
+		return
+	}
 	currentUser, ok := auth.CurrentUser(c)
 	if !ok {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "User not authenticated"})

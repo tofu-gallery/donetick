@@ -7,6 +7,8 @@ import { useUserProfile } from '../queries/UserQueries'
 import { useNotification } from '../service/NotificationProvider'
 import { apiClient } from '../utils/ApiClient'
 import { isPlusAccount, resolvePhotoURL } from '../utils/Helpers'
+// Tofu (2026-10-25): see the 503 check below
+import { uploadsNotSetUpError } from '../utils/UploadsNotSetUp'
 
 export const useFileUpload = ({
   draftId,
@@ -57,6 +59,14 @@ export const useFileUpload = ({
         if (draftId) formData.append('draftId', draftId)
 
         const response = await apiClient.upload('/assets/chore', formData)
+
+        // Tofu (2026-10-25): a copy whose owner has not added a storage bucket answers
+        // 503 with a sentence saying so; show it (utils/UploadsNotSetUp.js).
+        const notSetUp = await uploadsNotSetUpError(response)
+        if (notSetUp) {
+          showError(notSetUp)
+          return null
+        }
 
         if (response.status === 507) {
           showError({

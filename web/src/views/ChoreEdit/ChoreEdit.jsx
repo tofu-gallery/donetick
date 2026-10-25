@@ -104,6 +104,8 @@ import {
 import { getIconComponent } from '../../utils/ProjectIcons'
 import { getSafeBottomPadding } from '../../utils/SafeAreaUtils.js'
 import { useSinglePageTaskEditor } from '../../utils/TaskEditorPreferences'
+// Tofu (2026-10-25): see the 503 checks in the two attachment uploads
+import { uploadsNotSetUpError } from '../../utils/UploadsNotSetUp'
 import { generateUUID } from '../../utils/UUID'
 import { useProjectFilter } from '../Chores/hooks/useProjectFilter.js'
 import LoadingComponent from '../components/Loading.jsx'
@@ -983,6 +985,13 @@ const ChoreEdit = () => {
         : await UploadChoreAttachment(file, 'chore_attachment_draft', {
             draftId,
           })
+      // Tofu (2026-10-25): a copy whose owner has not added a storage bucket answers
+      // 503 with a sentence saying so; show it (utils/UploadsNotSetUp.js).
+      const notSetUp = await uploadsNotSetUpError(response)
+      if (notSetUp) {
+        showError(notSetUp)
+        return
+      }
       if (!response.ok) {
         showError({
           title: t('choreEdit.uploadFailedTitle'),
@@ -1944,6 +1953,14 @@ const ChoreEdit = () => {
                               'chore_attachment_draft',
                               { draftId },
                             )
+                        // Tofu (2026-10-25): a copy whose owner has not added a
+                        // storage bucket answers 503 with a sentence saying so;
+                        // show it (utils/UploadsNotSetUp.js).
+                        const notSetUp = await uploadsNotSetUpError(response)
+                        if (notSetUp) {
+                          showError(notSetUp)
+                          return
+                        }
                         if (!response.ok) {
                           showError({
                             title: 'Upload Failed',
