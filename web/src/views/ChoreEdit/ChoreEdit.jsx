@@ -992,6 +992,24 @@ const ChoreEdit = () => {
         showError(notSetUp)
         return
       }
+      // Tofu (2026-10-25): say why the server refused the file, as the other upload
+      // places do (hooks/useFileUpload.js): past the circle's storage
+      // (DT_STORAGE_MAX_USER_STORAGE, 507) or over the largest file
+      // (DT_STORAGE_MAX_FILE_SIZE, 413). Upstream showed "Upload Failed" for both.
+      if (response.status === 507) {
+        showError({
+          title: t('common:upload.quotaTitle'),
+          message: t('common:upload.quotaMessage'),
+        })
+        return
+      }
+      if (response.status === 413) {
+        showError({
+          title: t('common:upload.tooLargeTitle'),
+          message: t('common:upload.tooLargeMessage'),
+        })
+        return
+      }
       if (!response.ok) {
         showError({
           title: t('choreEdit.uploadFailedTitle'),
@@ -1959,6 +1977,25 @@ const ChoreEdit = () => {
                         const notSetUp = await uploadsNotSetUpError(response)
                         if (notSetUp) {
                           showError(notSetUp)
+                          return
+                        }
+                        // Tofu (2026-10-25): say why the server refused the file, as
+                        // the other upload places do (hooks/useFileUpload.js): past
+                        // the circle's storage (DT_STORAGE_MAX_USER_STORAGE, 507) or
+                        // over the largest file (DT_STORAGE_MAX_FILE_SIZE, 413).
+                        // Upstream showed "Upload Failed" for both.
+                        if (response.status === 507) {
+                          showError({
+                            title: t('common:upload.quotaTitle'),
+                            message: t('common:upload.quotaMessage'),
+                          })
+                          return
+                        }
+                        if (response.status === 413) {
+                          showError({
+                            title: t('common:upload.tooLargeTitle'),
+                            message: t('common:upload.tooLargeMessage'),
+                          })
                           return
                         }
                         if (!response.ok) {
