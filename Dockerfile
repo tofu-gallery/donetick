@@ -83,7 +83,7 @@ COPY tofu-entrypoint.sh /tofu-entrypoint.sh
 ENV DT_ENV="selfhosted"
 # Tofu (2026-10-25): the web app's "Source code" links open the exact source this image is
 # built from (AGPL-3.0 section 13); an owner who changes the code points it at theirs.
-ENV DT_SOURCE_URL=https://github.com/tofu-gallery/donetick/tree/pin/2026-10-25.2
+ENV DT_SOURCE_URL=https://github.com/tofu-gallery/donetick/tree/pin/2026-10-26
 
 # Expose the application port
 EXPOSE 2021
