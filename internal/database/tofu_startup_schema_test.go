@@ -11,12 +11,37 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/glebarez/sqlite"
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
 
 	"donetick.com/core/config"
 )
+
+func TestAppTablesNamesEveryTable(t *testing.T) {
+	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	names, err := appTables(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 40 models, the data migrations' table among them, and sql-migrate's table.
+	if len(names) != 41 {
+		t.Errorf("got %d tables: %v", len(names), names)
+	}
+	for _, want := range []string{"users", "chores", "migrations", "gorp_migrations", "calendar_tokens"} {
+		found := false
+		for _, name := range names {
+			found = found || name == want
+		}
+		if !found {
+			t.Errorf("%s is missing from %v", want, names)
+		}
+	}
+}
 
 type fakePgError struct{ code string }
 
@@ -36,8 +61,9 @@ func TestIsDuplicateObjectError(t *testing.T) {
 }
 
 // Five servers starting at the same moment against one empty PostgreSQL database must
-// all get through the schema step. Runs only with TOFU_TEST_POSTGRES_URL set to an
-// EMPTY database, for example postgresql://user:password@127.0.0.1:5432/scratch?sslmode=disable.
+// all get through the schema step, and leave every table the app makes with row-level
+// security on. Runs only with TOFU_TEST_POSTGRES_URL set to an EMPTY database, for
+// example postgresql://user:password@127.0.0.1:5432/scratch?sslmode=disable.
 func TestStartupSchemaConcurrentStarts(t *testing.T) {
 	url := os.Getenv("TOFU_TEST_POSTGRES_URL")
 	if url == "" {
@@ -71,13 +97,13 @@ func TestStartupSchemaConcurrentStarts(t *testing.T) {
 		}
 	}
 	db := open()
-	var tables, sqlMigrations, dataMigrations int64
-	if err := db.Raw(`SELECT count(*) FROM pg_class c
-		JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = current_schema() AND c.relkind = 'r'`).Row().Scan(&tables); err != nil {
+	var tables, closed, sqlMigrations, dataMigrations int64
+	if err := db.Raw(`SELECT count(*), count(*) FILTER (WHERE c.relrowsecurity) FROM pg_class c
+		JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = current_schema() AND c.relkind = 'r'`).Row().Scan(&tables, &closed); err != nil {
 		t.Fatal(err)
 	}
-	if tables != 41 {
-		t.Errorf("%d tables; want 41", tables)
+	if tables != 41 || closed != 41 {
+		t.Errorf("%d tables, %d with row-level security; want 41 and 41", tables, closed)
 	}
 	if err := db.Raw(`SELECT (SELECT count(*) FROM gorp_migrations), (SELECT count(*) FROM migrations)`).Row().Scan(&sqlMigrations, &dataMigrations); err != nil {
 		t.Fatal(err)

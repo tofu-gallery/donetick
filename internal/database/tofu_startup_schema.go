@@ -7,6 +7,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"regexp"
+	"strings"
 	"time"
 
 	migrate "github.com/rubenv/sql-migrate"
@@ -32,8 +34,9 @@ const sqlMigrationsTable = "gorp_migrations"
 const createSQLMigrationsTable = `create table if not exists "gorp_migrations" ("id" text not null primary key, "applied_at" timestamp with time zone)`
 
 // StartupSchema runs everything a start does to the database's schema: GORM's
-// AutoMigrate, Donetick's data migrations (recorded in the migrations table) and the
-// SQL files in internal/database/migrations (recorded in gorp_migrations).
+// AutoMigrate, Donetick's data migrations (recorded in the migrations table), the SQL
+// files in internal/database/migrations (recorded in gorp_migrations) and, on
+// PostgreSQL, row-level security on every table the app makes.
 //
 // Several copies of the server may start at the same moment against the same database
 // (a host that starts more than one container for a new deployment), and upstream's
@@ -119,7 +122,16 @@ func startupSchemaStep(ctx context.Context, tx *gorm.DB) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return fmt.Sprintf("schema checked and brought up to date, %d SQL migrations applied (waited %s for the lock)", applied, waited), nil
+	outcome := fmt.Sprintf("schema checked and brought up to date, %d SQL migrations applied (waited %s for the lock)", applied, waited)
+
+	closed, err := enableRowLevelSecurity(tx)
+	if err != nil {
+		return "", fmt.Errorf("row-level security: %w", err)
+	}
+	if closed > 0 {
+		outcome += fmt.Sprintf("; row-level security turned on for %d tables", closed)
+	}
+	return outcome, nil
 }
 
 // runSQLMigrations applies the SQL files of internal/database/migrations that
@@ -172,6 +184,91 @@ func runSQLMigrations(tx *gorm.DB) (int, error) {
 	}
 	fmt.Printf("Applied %d migrations!\n", n)
 	return n, nil
+}
+
+var plainTableName = regexp.MustCompile(`^[a-z_][a-z0-9_]*$`)
+
+// appTables names every table the app makes: the tables of the models AutoMigrate
+// creates (the data migrations' migrations table among them) with any join tables
+// they declare, and sql-migrate's gorp_migrations.
+func appTables(db *gorm.DB) ([]string, error) {
+	seen := map[string]bool{}
+	var names []string
+	add := func(name string) {
+		if !seen[name] {
+			seen[name] = true
+			names = append(names, name)
+		}
+	}
+	for _, model := range autoMigrateModels {
+		stmt := &gorm.Statement{DB: db}
+		if err := stmt.Parse(model); err != nil {
+			return nil, err
+		}
+		add(stmt.Schema.Table)
+		for _, rel := range stmt.Schema.Relationships.Many2Many {
+			if rel.JoinTable != nil {
+				add(rel.JoinTable.Table)
+			}
+		}
+	}
+	add(sqlMigrationsTable)
+	for _, name := range names {
+		if !plainTableName.MatchString(name) {
+			return nil, fmt.Errorf("unexpected table name %q", name)
+		}
+	}
+	return names, nil
+}
+
+// enableRowLevelSecurity turns row-level security on for every table the app makes
+// that does not have it yet, in one round trip, and returns how many it changed. On a
+// database whose default privileges grant new tables in public to the roles of
+// Supabase's Data API (anon, authenticated), as Tofu's databases made before
+// 2026-10-30 do, the app's tables would otherwise be readable and writable through
+// that API by anyone holding the project's public key. With row-level security on and
+// no policy those roles get no row, while the server's own connection, which owns the
+// tables, is not limited by it. Only tables this role owns are touched.
+func enableRowLevelSecurity(tx *gorm.DB) (int, error) {
+	names, err := appTables(tx)
+	if err != nil {
+		return 0, err
+	}
+	rows, err := tx.Raw(`SELECT n.nspname, c.relname
+		FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+		WHERE n.nspname = current_schema() AND c.relkind IN ('r', 'p') AND NOT c.relrowsecurity
+			AND pg_has_role(c.relowner, 'USAGE') AND c.relname = ANY(string_to_array(?, ','))
+		ORDER BY c.relname`, strings.Join(names, ",")).Rows()
+	if err != nil {
+		return 0, err
+	}
+	var statements strings.Builder
+	n := 0
+	for rows.Next() {
+		var schema, table string
+		if err := rows.Scan(&schema, &table); err != nil {
+			rows.Close()
+			return 0, err
+		}
+		fmt.Fprintf(&statements, "ALTER TABLE %s.%s ENABLE ROW LEVEL SECURITY;\n", quoteIdentifier(schema), quoteIdentifier(table))
+		n++
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return 0, err
+	}
+	rows.Close()
+	if n == 0 {
+		return 0, nil
+	}
+	if err := tx.Exec(statements.String()).Error; err != nil {
+		return 0, err
+	}
+	return n, nil
+}
+
+func quoteIdentifier(name string) string {
+	return `"` + strings.ReplaceAll(name, `"`, `""`) + `"`
 }
 
 // sqlState is the SQLSTATE of a PostgreSQL error anywhere in err's chain, or "".
