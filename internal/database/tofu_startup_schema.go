@@ -5,8 +5,13 @@ package database
 
 import (
 	"context"
+	"crypto/sha256"
+	"database/sql"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
+	"os"
 	"regexp"
 	"strings"
 	"time"
@@ -32,6 +37,11 @@ const startupSchemaLockWait = 3 * time.Minute
 // this table, which it creates with this statement (its defaults for PostgreSQL).
 const sqlMigrationsTable = "gorp_migrations"
 const createSQLMigrationsTable = `create table if not exists "gorp_migrations" ("id" text not null primary key, "applied_at" timestamp with time zone)`
+
+// The comment on the migrations table that names the server build which last
+// completed the whole schema step. A start of the same build finds it and skips the
+// step, instead of checking all 40 tables again, column by column.
+const startupSchemaMarkerPrefix = "Tofu: the start-up schema step was last completed by the server build sha256:"
 
 // StartupSchema runs everything a start does to the database's schema: GORM's
 // AutoMigrate, Donetick's data migrations (recorded in the migrations table), the SQL
@@ -63,11 +73,12 @@ func StartupSchema(ctx context.Context, db *gorm.DB, cfg *config.Config) error {
 	}
 
 	log := logging.DefaultLogger()
+	build := serverBuildID()
 	run := func() (string, error) {
 		var outcome string
 		err := db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 			var err error
-			outcome, err = startupSchemaStep(ctx, tx)
+			outcome, err = startupSchemaStep(ctx, tx, build)
 			return err
 		})
 		return outcome, err
@@ -89,7 +100,7 @@ func StartupSchema(ctx context.Context, db *gorm.DB, cfg *config.Config) error {
 
 // startupSchemaStep is the body of the one transaction: the bounded wait for the
 // lock, then the schema state read inside the lock, never assumed.
-func startupSchemaStep(ctx context.Context, tx *gorm.DB) (string, error) {
+func startupSchemaStep(ctx context.Context, tx *gorm.DB, build string) (string, error) {
 	log := logging.DefaultLogger()
 	if err := tx.Exec(fmt.Sprintf("SET LOCAL lock_timeout = '%dms'", startupSchemaLockWait.Milliseconds())).Error; err != nil {
 		return "", err
@@ -103,26 +114,47 @@ func startupSchemaStep(ctx context.Context, tx *gorm.DB) (string, error) {
 	}
 	waited := time.Since(waitStart).Round(time.Millisecond)
 
-	if err := Migration(tx); err != nil {
-		return "", fmt.Errorf("auto-migrate: %w", err)
+	marker := ""
+	if build != "" {
+		marker = startupSchemaMarkerPrefix + build
 	}
-	// Upstream goes on when a data migration fails, and so does this step: the
-	// savepoint undoes this start's data migrations, which stay unrecorded and run
-	// again at the next start, as they would upstream.
-	if err := tx.SavePoint("tofu_data_migrations").Error; err != nil {
+	var current sql.NullString
+	if err := tx.Raw(`SELECT obj_description(to_regclass('migrations'), 'pg_class')`).Row().Scan(&current); err != nil {
 		return "", err
 	}
-	if err := migrations.Run(ctx, tx); err != nil {
-		log.Errorf("start-up schema: a data migration failed, the server goes on without it: %v", err)
-		if err := tx.RollbackTo("tofu_data_migrations").Error; err != nil {
+
+	var outcome string
+	if marker != "" && current.Valid && current.String == marker {
+		outcome = fmt.Sprintf("already done by another start of this build (waited %s for the lock)", waited)
+	} else {
+		if err := Migration(tx); err != nil {
+			return "", fmt.Errorf("auto-migrate: %w", err)
+		}
+		// Upstream goes on when a data migration fails, and so does this step: the
+		// savepoint undoes this start's data migrations, which stay unrecorded and run
+		// again at the next start, as they would upstream.
+		dataMigrationsDone := true
+		if err := tx.SavePoint("tofu_data_migrations").Error; err != nil {
 			return "", err
 		}
+		if err := migrations.Run(ctx, tx); err != nil {
+			log.Errorf("start-up schema: a data migration failed, the server goes on without it: %v", err)
+			if err := tx.RollbackTo("tofu_data_migrations").Error; err != nil {
+				return "", err
+			}
+			dataMigrationsDone = false
+		}
+		applied, err := runSQLMigrations(tx)
+		if err != nil {
+			return "", err
+		}
+		if dataMigrationsDone && marker != "" {
+			if err := tx.Exec(`COMMENT ON TABLE migrations IS '` + marker + `'`).Error; err != nil {
+				return "", err
+			}
+		}
+		outcome = fmt.Sprintf("schema checked and brought up to date, %d SQL migrations applied (waited %s for the lock)", applied, waited)
 	}
-	applied, err := runSQLMigrations(tx)
-	if err != nil {
-		return "", err
-	}
-	outcome := fmt.Sprintf("schema checked and brought up to date, %d SQL migrations applied (waited %s for the lock)", applied, waited)
 
 	closed, err := enableRowLevelSecurity(tx)
 	if err != nil {
@@ -269,6 +301,26 @@ func enableRowLevelSecurity(tx *gorm.DB) (int, error) {
 
 func quoteIdentifier(name string) string {
 	return `"` + strings.ReplaceAll(name, `"`, `""`) + `"`
+}
+
+// serverBuildID is the SHA-256 of the running server's own executable, so any
+// change to the code, or a new build, makes a start run the whole schema step again.
+// It is empty when the executable cannot be read, and then every start runs it.
+func serverBuildID() string {
+	path, err := os.Executable()
+	if err != nil {
+		return ""
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return ""
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return ""
+	}
+	return hex.EncodeToString(h.Sum(nil))
 }
 
 // sqlState is the SQLSTATE of a PostgreSQL error anywhere in err's chain, or "".
