@@ -59,7 +59,6 @@ import (
 	uRepo "donetick.com/core/internal/user/repo"
 	"donetick.com/core/internal/utils"
 	"donetick.com/core/logging"
-	"donetick.com/core/migrations"
 	"github.com/gin-contrib/cors"
 	"github.com/gin-gonic/gin"
 	"go.uber.org/fx"
@@ -320,10 +319,12 @@ func newServer(lc fx.Lifecycle, cfg *config.Config, db *gorm.DB, notifier *notif
 	lc.Append(fx.Hook{
 		OnStart: func(ctx context.Context) error {
 			if cfg.Database.Migration {
-				database.Migration(db)
-				migrations.Run(context.Background(), db)
-				err := database.MigrationScripts(db, cfg)
-				if err != nil {
+				// Tofu (2026-10-26): upstream ran database.Migration, migrations.Run and
+				// database.MigrationScripts here, one after the other. database.StartupSchema
+				// runs the same three steps, and on PostgreSQL as one transaction under an
+				// advisory lock, so that several starts at the same moment do not race
+				// (internal/database/tofu_startup_schema.go).
+				if err := database.StartupSchema(context.Background(), db, cfg); err != nil {
 					panic(err)
 				}
 			}
