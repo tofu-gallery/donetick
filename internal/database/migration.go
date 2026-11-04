@@ -31,10 +31,38 @@ import (
 //go:embed migrations/*.sql
 var embeddedMigrations embed.FS
 
+// migrateItemSharing preserves visibility once when introducing opt-in sharing.
+// Old schemas without privacy shared every item; intermediate schemas used the
+// inverse is_private flag. New tables use the model's false default.
+func migrateItemSharing(db *gorm.DB) error {
+	return db.Transaction(func(tx *gorm.DB) error {
+		for _, model := range []interface{}{&lModel.Label{}, &filterModel.Filter{}} {
+			if !tx.Migrator().HasTable(model) || tx.Migrator().HasColumn(model, "is_shared") {
+				continue
+			}
+			hadPrivacy := tx.Migrator().HasColumn(model, "is_private")
+			if err := tx.Migrator().AddColumn(model, "IsShared"); err != nil {
+				return err
+			}
+			value := interface{}(true)
+			if hadPrivacy {
+				value = gorm.Expr("NOT COALESCE(is_private, false)")
+			}
+			if err := tx.Model(model).Where("1 = 1").UpdateColumn("is_shared", value).Error; err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
 // Tofu (2026-10-26): the models AutoMigrate creates are listed in autoMigrateModels,
 // which tofu_startup_schema.go also reads to name the tables the app makes. The list
 // itself is upstream's, unchanged.
 func Migration(db *gorm.DB) error {
+	if err := migrateItemSharing(db); err != nil {
+		return err
+	}
 	if err := db.AutoMigrate(autoMigrateModels...); err != nil {
 		return err
 	}
@@ -67,6 +95,8 @@ var autoMigrateModels = []interface{}{uModel.User{}, chModel.Chore{},
 	chModel.ChoreLabels{},
 	projModel.Project{},
 	projModel.ProjectMember{},
+	projModel.ProjectSection{},
+	projModel.ProjectViewPreference{},
 	filterModel.Filter{},
 	migrations.Migration{},
 	pModel.PointsHistory{},
@@ -81,6 +111,7 @@ var autoMigrateModels = []interface{}{uModel.User{}, chModel.Chore{},
 	rwModel.RewardRedemption{},
 	bridgeModel.Settings{},
 	calModel.CalendarToken{},
+	uModel.UserNotificationPreference{},
 }
 
 func MigrationScripts(gormDB *gorm.DB, cfg *config.Config) error {

@@ -40,7 +40,7 @@ const createSQLMigrationsTable = `create table if not exists "gorp_migrations" (
 
 // The comment on the migrations table that names the server build which last
 // completed the whole schema step. A start of the same build finds it and skips the
-// step, instead of checking all 40 tables again, column by column.
+// step, instead of checking every table again, column by column.
 const startupSchemaMarkerPrefix = "Tofu: the start-up schema step was last completed by the server build sha256:"
 
 // StartupSchema runs everything a start does to the database's schema: GORM's

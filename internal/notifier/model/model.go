@@ -23,7 +23,6 @@ type Notification struct {
 type NotificationDetails struct {
 	Notification
 	WebhookURL *string `json:"webhook_url" gorm:"column:webhook_url;<-:null"` // read-only, will only be used if webhook enabled
-
 }
 
 func (n *Notification) IsValid() bool {

@@ -34,6 +34,17 @@ const (
 	FrequencyTypeAlways        FrequencyType = "always"
 )
 
+// Priority levels for Chore.Priority (0-4, see handler.go PriorityReq binding).
+// Matches the frontend's P1-P4 convention: lower numbers are MORE urgent
+// (P1/PriorityUrgent is the most urgent, P4/PriorityLow is the least).
+const (
+	PriorityNone   = 0
+	PriorityUrgent = 1
+	PriorityHigh   = 2
+	PriorityMedium = 3
+	PriorityLow    = 4
+)
+
 type AssignmentStrategy string
 
 const (
@@ -78,6 +89,8 @@ type Chore struct {
 	IsPrivate              bool                       `json:"isPrivate" gorm:"column:is_private;default:false"`                                       // Whether the chore is private
 	ProjectID              *int                       `json:"projectId,omitempty" gorm:"column:project_id;index"`                                     // The project this chore belongs to
 	Project                *pModel.Project            `json:"project,omitempty" gorm:"foreignkey:ProjectID;references:ID"`                            // Project relationship
+	SectionID              *int                       `json:"sectionId,omitempty" gorm:"column:section_id;index"`                                     // The project section (board column) this chore is placed in; nil falls back to the project's first section
+	BoardPosition          int                        `json:"boardPosition" gorm:"column:board_position;not null;default:0"`                          // Ordering of the chore within its section, shared by every viewer of the project
 	SyncVersion            int64                      `json:"syncVersion" gorm:"column:sync_version;not null;default:0;index;index:idx_chores_circle_sync_version,priority:2"`
 	Attachments            []storageModel.StorageFile `json:"attachments,omitempty" gorm:"-"`
 }
@@ -192,6 +205,9 @@ type ChoreDetail struct {
 	StartTime           *time.Time                 `json:"startTime" gorm:"column:start_time"`
 	TimerUpdatedAt      *time.Time                 `json:"timerUpdatedAt" gorm:"column:timer_updated_at"` // When the chore was last started
 	ProjectID           *int                       `json:"projectId,omitempty" gorm:"column:project_id"`
+	CircleID            int                        `json:"circleId" gorm:"column:circle_id"`             // Needed client-side to resolve the viewer's circle role (approve/edit permissions)
+	IsPrivate           bool                       `json:"isPrivate" gorm:"column:is_private"`           //
+	AssignStrategy      AssignmentStrategy         `json:"assignStrategy" gorm:"column:assign_strategy"` //
 	IsActive            bool                       `json:"isActive" gorm:"column:is_active"`
 	SyncVersion         int64                      `json:"syncVersion" gorm:"column:sync_version"`
 	Attachments         []storageModel.StorageFile `json:"attachments,omitempty" gorm:"-"`

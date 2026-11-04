@@ -28,11 +28,12 @@ func TestAppTablesNamesEveryTable(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// 40 models, the data migrations' table among them, and sql-migrate's table.
-	if len(names) != 41 {
+	// 43 models, the data migrations' table among them, and sql-migrate's table.
+	if len(names) != 44 {
 		t.Errorf("got %d tables: %v", len(names), names)
 	}
-	for _, want := range []string{"users", "chores", "migrations", "gorp_migrations", "calendar_tokens"} {
+	for _, want := range []string{"users", "chores", "migrations", "gorp_migrations", "calendar_tokens",
+		"project_sections", "project_view_preferences", "user_notification_preferences"} {
 		found := false
 		for _, name := range names {
 			found = found || name == want
@@ -102,8 +103,8 @@ func TestStartupSchemaConcurrentStarts(t *testing.T) {
 		JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = current_schema() AND c.relkind = 'r'`).Row().Scan(&tables, &closed); err != nil {
 		t.Fatal(err)
 	}
-	if tables != 41 || closed != 41 {
-		t.Errorf("%d tables, %d with row-level security; want 41 and 41", tables, closed)
+	if tables != 44 || closed != 44 {
+		t.Errorf("%d tables, %d with row-level security; want 44 and 44", tables, closed)
 	}
 	if err := db.Raw(`SELECT (SELECT count(*) FROM gorp_migrations), (SELECT count(*) FROM migrations)`).Row().Scan(&sqlMigrations, &dataMigrations); err != nil {
 		t.Fatal(err)

@@ -38,6 +38,7 @@ import (
 	sRepo "donetick.com/core/external/payment/repo"
 	sService "donetick.com/core/external/payment/service"
 	notifier "donetick.com/core/internal/notifier"
+	"donetick.com/core/internal/notifier/dispatch"
 	"donetick.com/core/internal/notifier/push"
 	nRepo "donetick.com/core/internal/notifier/repo"
 	nps "donetick.com/core/internal/notifier/service"
@@ -125,6 +126,7 @@ func main() {
 
 		fx.Provide(nRepo.NewNotificationRepository),
 		fx.Provide(nps.NewNotificationPlanner),
+		fx.Provide(nps.NewDigestPlanner),
 
 		// add notifier
 		fx.Provide(pushover.NewPushover),
@@ -135,6 +137,7 @@ func main() {
 		fx.Provide(events.NewEventsProducer),
 		fx.Provide(fcm.NewFCMNotifier),
 		fx.Provide(push.NewSender),
+		fx.Provide(dispatch.NewDispatcher),
 
 		// Rate limiter
 		fx.Provide(utils.NewRateLimiter),

@@ -4,9 +4,12 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"html"
 	"net/http"
+	"net/url"
+	"path"
 	"strings"
 	"time"
 
@@ -126,6 +129,11 @@ func (h *Handler) signUp(c *gin.Context) {
 		Password    string `json:"password" binding:"required,min=8,max=64"`
 		Email       string `json:"email" binding:"required,email"`
 		DisplayName string `json:"displayName"`
+		// Timezone is the client's IANA zone (e.g. "America/New_York"), sent at
+		// signup so time-of-day features -- digest notifications above all --
+		// work from the first day. Optional: older clients omit it and the user
+		// stays on the UTC fallback until they save a timezone in settings.
+		Timezone string `json:"timezone"`
 	}
 	var signupReq SignUpReq
 	if err := c.BindJSON(&signupReq); err != nil {
@@ -136,6 +144,14 @@ func (h *Handler) signUp(c *gin.Context) {
 	}
 	if signupReq.DisplayName == "" {
 		signupReq.DisplayName = signupReq.Username
+	}
+
+	// A bad timezone isn't worth failing a signup over -- drop it and let the
+	// user correct it in settings, same as a client that never sent one.
+	if signupReq.Timezone != "" && !utils.IsValidTimezone(signupReq.Timezone) {
+		logging.FromContext(c).Warn("signup: ignoring invalid timezone",
+			"timezone", signupReq.Timezone, "username", signupReq.Username)
+		signupReq.Timezone = ""
 	}
 
 	// Validate username format
@@ -162,6 +178,7 @@ func (h *Handler) signUp(c *gin.Context) {
 		Password:    password,
 		DisplayName: signupReq.DisplayName,
 		Email:       signupReq.Email,
+		Timezone:    signupReq.Timezone,
 		CreatedAt:   time.Now().UTC(),
 		UpdatedAt:   time.Now().UTC(),
 	}); err != nil {
@@ -946,6 +963,45 @@ func (h *Handler) updateUserPassword(c *gin.Context) {
 
 }
 
+// validateUserImage constrains what a client may store in User.Image. The
+// field is later fed to storage.Delete by updateProfilePhoto, so an arbitrary
+// string here is a path-traversal primitive: a value like
+// "x/profiles/../users/<other id>/<uuid>.ext" is re-sliced at "profiles/" and
+// cleaned into another user's private upload key.
+//
+// Only two shapes are legitimate: an absolute http(s) URL (an OIDC picture
+// claim or a public-bucket URL), or the caller's own profiles/<id>/ storage
+// key. A signed key may round-trip back from GET /users with its signature
+// query attached, so that is stripped rather than rejected.
+func validateUserImage(image string, userID int) (string, error) {
+	if image == "" {
+		return "", nil
+	}
+	if strings.HasPrefix(image, "http://") || strings.HasPrefix(image, "https://") {
+		if _, err := url.ParseRequestURI(image); err != nil {
+			return "", errors.New("Invalid image URL")
+		}
+		return image, nil
+	}
+
+	key := image
+	if idx := strings.IndexAny(key, "?#"); idx >= 0 {
+		key = key[:idx]
+	}
+	key = path.Clean(key)
+	// Legacy rows stored the storage base directory in the path
+	// (e.g. "uploads/profiles/2/uuid.jpg"); normalize to the relative key so
+	// a client echoing one back is not rejected. Cleaning first is what makes
+	// this safe — a traversal segment can no longer survive the re-slice.
+	if idx := strings.Index(key, "profiles/"); idx > 0 {
+		key = key[idx:]
+	}
+	if !strings.HasPrefix(key, fmt.Sprintf("profiles/%d/", userID)) {
+		return "", errors.New("Invalid image: must be an http(s) URL or your own profile photo path")
+	}
+	return key, nil
+}
+
 func (h *Handler) UpdateUserDetails(c *gin.Context) {
 	type UpdateUserReq struct {
 		DisplayName *string `json:"displayName" binding:"omitempty"`
@@ -975,7 +1031,14 @@ func (h *Handler) UpdateUserDetails(c *gin.Context) {
 		user.ChatID = *req.ChatID
 	}
 	if req.Image != nil {
-		user.Image = *req.Image
+		img, err := validateUserImage(*req.Image, user.ID)
+		if err != nil {
+			c.JSON(400, gin.H{
+				"error": err.Error(),
+			})
+			return
+		}
+		user.Image = img
 	}
 	if req.Timezone != nil {
 		if !utils.IsValidTimezone(*req.Timezone) {
@@ -1139,6 +1202,109 @@ func (h *Handler) DeleteUserToken(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{})
+}
+
+// GetNotificationPreference returns the current user's notification profile
+// and overrides, plus the resolved (profile ⊕ overrides) value for every
+// known event type so clients don't need to re-implement the resolution rule.
+func (h *Handler) GetNotificationPreference(c *gin.Context) {
+	currentUser, ok := auth.CurrentUser(c)
+	if !ok {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "User not authenticated"})
+		return
+	}
+
+	pref, err := h.userRepo.GetNotificationPreference(c, currentUser.ID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to get notification preference"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"profile":    pref.Profile,
+		"overrides":  pref.Overrides,
+		"digestHour": pref.DigestHour,
+		"effective":  resolvedNotificationPreference(pref),
+	})
+}
+
+type UpdateNotificationPreferenceReq struct {
+	Profile   uModel.NotificationProfile   `json:"profile" binding:"required,oneof=balanced planner just_in_time persistent quiet custom"`
+	Overrides uModel.NotificationOverrides `json:"overrides"`
+	// DigestHour is a pointer so an omitted field leaves the previously saved
+	// hour untouched instead of resetting it to 0 (midnight).
+	DigestHour *int `json:"digestHour" binding:"omitempty,gte=0,lte=23"`
+}
+
+func (h *Handler) UpdateNotificationPreference(c *gin.Context) {
+	currentUser, ok := auth.CurrentUser(c)
+	if !ok {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "User not authenticated"})
+		return
+	}
+
+	var req UpdateNotificationPreferenceReq
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request: " + err.Error()})
+		return
+	}
+
+	current, err := h.userRepo.GetNotificationPreference(c, currentUser.ID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to load existing notification preference"})
+		return
+	}
+
+	// Picking a different named profile means "give me this profile's posture",
+	// so any overrides carried over from the previous one are dropped. Without
+	// this a client that posts back the resolved set it was showing (every event
+	// type, not just the flipped ones) would pin the old behavior and make the
+	// new profile cosmetic. Custom is exempt: it *is* the overrides.
+	overrides := req.Overrides
+	if req.Profile != current.Profile && req.Profile != uModel.NotificationProfileCustom {
+		overrides = nil
+	}
+
+	pref := &uModel.UserNotificationPreference{
+		UserID:     currentUser.ID,
+		Profile:    req.Profile,
+		Overrides:  uModel.SparseOverrides(req.Profile, overrides),
+		DigestHour: current.DigestHour,
+	}
+	if req.DigestHour != nil {
+		pref.DigestHour = *req.DigestHour
+	}
+	if err := h.userRepo.UpsertNotificationPreference(c, pref); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update notification preference"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"profile":    pref.Profile,
+		"overrides":  pref.Overrides,
+		"digestHour": pref.DigestHour,
+		"effective":  resolvedNotificationPreference(pref),
+	})
+}
+
+// resolvedNotificationPreference returns the on/off value for every known
+// event type after applying overrides on top of the profile default.
+func resolvedNotificationPreference(pref *uModel.UserNotificationPreference) map[uModel.NotificationEventType]bool {
+	eventTypes := []uModel.NotificationEventType{
+		uModel.NotificationEventOnAssignment,
+		uModel.NotificationEventOnPendingApproval,
+		uModel.NotificationEventOnRedemptionRequest,
+		uModel.NotificationEventPreDue,
+		uModel.NotificationEventDue,
+		uModel.NotificationEventOverdueFollowup,
+		uModel.NotificationEventDailyDigest,
+		uModel.NotificationEventWeeklyDigest,
+	}
+	resolved := make(map[uModel.NotificationEventType]bool, len(eventTypes))
+	for _, t := range eventTypes {
+		resolved[t] = pref.Enabled(t)
+	}
+	return resolved
 }
 
 func (h *Handler) UpdateNotificationTarget(c *gin.Context) {
@@ -1347,8 +1513,17 @@ func (h *Handler) updateProfilePhoto(c *gin.Context) {
 		if idx := strings.Index(prev, "profiles/"); idx > 0 {
 			prev = prev[idx:]
 		}
-		if derr := h.storage.Delete(c, []string{prev}); derr != nil {
-			logging.FromContext(c).Warnw("Failed to delete previous profile photo", "path", prev, "error", derr)
+		// prev ultimately comes from the user-editable Image field (see the
+		// PUT /users handler), so a value like "profiles/../users/1/x.jpg"
+		// would resolve outside the profiles/ tree once storage.Delete
+		// cleans it, and "profiles/<other id>/x.jpg" would hit another user's
+		// photo. Only delete keys that are still under this user's own
+		// profiles/<id>/ prefix after cleaning.
+		ownPrefix := fmt.Sprintf("profiles/%d/", currentUser.ID)
+		if clean := path.Clean(prev); strings.HasPrefix(clean, ownPrefix) {
+			if derr := h.storage.Delete(c, []string{clean}); derr != nil {
+				logging.FromContext(c).Warnw("Failed to delete previous profile photo", "path", clean, "error", derr)
+			}
 		}
 	}
 
@@ -1820,6 +1995,8 @@ func Routes(router *gin.Engine, h *Handler, jwtAuth *jwt.GinJWTMiddleware, multi
 		userRoutes.DELETE("/tokens/:id", h.DeleteUserToken)
 		userRoutes.PUT("/webhook", h.setWebhook)
 		userRoutes.PUT("/targets", h.UpdateNotificationTarget)
+		userRoutes.GET("/notifications/preferences", h.GetNotificationPreference)
+		userRoutes.PUT("/notifications/preferences", h.UpdateNotificationPreference)
 		userRoutes.PUT("change_password", h.updateUserPasswordLoggedInOnly)
 		userRoutes.POST("profile_photo", h.updateProfilePhoto)
 		userRoutes.GET("storage", h.getStorageUsage)

@@ -21,6 +21,7 @@ import (
 	cModel "donetick.com/core/internal/circle/model"
 	cRepo "donetick.com/core/internal/circle/repo"
 	"donetick.com/core/internal/database"
+	dRepo "donetick.com/core/internal/device/repo"
 	"donetick.com/core/internal/events"
 	lModel "donetick.com/core/internal/label/model"
 	lRepo "donetick.com/core/internal/label/repo"
@@ -31,6 +32,7 @@ import (
 	stRepo "donetick.com/core/internal/subtask/repo"
 	tRepo "donetick.com/core/internal/thing/repo"
 	uModel "donetick.com/core/internal/user/model"
+	urRepo "donetick.com/core/internal/user/repo"
 )
 
 func TestDueDatesDiffer(t *testing.T) {
@@ -82,7 +84,7 @@ func newCreateChoreTestRouter(t *testing.T) (*gin.Engine, *gorm.DB) {
 	h := &Handler{
 		choreRepo:     chRepo.NewChoreRepository(db, cfg),
 		circleRepo:    circleRepository,
-		nPlanner:      nps.NewNotificationPlanner(nRepo.NewNotificationRepository(db), circleRepository),
+		nPlanner:      nps.NewNotificationPlanner(nRepo.NewNotificationRepository(db), circleRepository, urRepo.NewUserRepository(db, cfg), dRepo.NewDeviceRepository(db, cfg)),
 		eventProducer: eventProducer,
 	}
 
@@ -92,6 +94,7 @@ func newCreateChoreTestRouter(t *testing.T) (*gin.Engine, *gorm.DB) {
 		c.Next()
 	})
 	router.POST("/chores", h.CreateChore)
+	router.POST("/chores/bulk", h.BulkCreateChores)
 	return router, db
 }
 
@@ -192,7 +195,7 @@ func newEditChoreTestRouter(t *testing.T) (*gin.Engine, *gorm.DB) {
 		tRepo:         tRepo.NewThingRepository(db, cfg),
 		storage:       storage.NewLocalStorage(cfg),
 		storageRepo:   storageRepo.NewStorageRepository(db, cfg),
-		nPlanner:      nps.NewNotificationPlanner(nRepo.NewNotificationRepository(db), circleRepository),
+		nPlanner:      nps.NewNotificationPlanner(nRepo.NewNotificationRepository(db), circleRepository, urRepo.NewUserRepository(db, cfg), dRepo.NewDeviceRepository(db, cfg)),
 		eventProducer: eventProducer,
 	}
 

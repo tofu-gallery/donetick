@@ -4,6 +4,7 @@ import (
 	"context"
 	"time"
 
+	chModel "donetick.com/core/internal/chore/model"
 	nModel "donetick.com/core/internal/notifier/model"
 	"gorm.io/gorm"
 )
@@ -18,6 +19,53 @@ func NewNotificationRepository(db *gorm.DB) *NotificationRepository {
 
 func (r *NotificationRepository) DeleteAllChoreNotifications(choreID int) error {
 	return r.db.Where("chore_id = ?", choreID).Delete(&nModel.Notification{}).Error
+}
+
+// IsCurrentChore rejects delayed planning jobs for an older task revision.
+func (r *NotificationRepository) IsCurrentChore(c context.Context, chore *chModel.Chore) (bool, error) {
+	var current chModel.Chore
+	err := r.db.WithContext(c).Select("id", "sync_version", "updated_at", "assigned_to", "is_active", "status").First(&current, chore.ID).Error
+	if err == gorm.ErrRecordNotFound {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	sameAssignee := current.AssignedTo == nil && chore.AssignedTo == nil ||
+		current.AssignedTo != nil && chore.AssignedTo != nil && *current.AssignedTo == *chore.AssignedTo
+	return current.SyncVersion == chore.SyncVersion && current.UpdatedAt.Equal(chore.UpdatedAt) &&
+		sameAssignee && current.IsActive == chore.IsActive && current.Status == chore.Status, nil
+}
+
+// DeleteChoreReminders resets due-date reminders without losing pending assignment
+// or approval events during a subsequent edit. Superseded events are discarded.
+// Inspect JSON in Go to keep this portable across SQLite and Postgres.
+func (r *NotificationRepository) DeleteChoreReminders(c context.Context, choreID int, assignedTo *int, approvalRecipients []int) error {
+	approvers := make(map[int]bool, len(approvalRecipients))
+	for _, userID := range approvalRecipients {
+		approvers[userID] = true
+	}
+	return r.db.WithContext(c).Transaction(func(tx *gorm.DB) error {
+		var notifications []nModel.Notification
+		if err := tx.Where("chore_id = ?", choreID).Find(&notifications).Error; err != nil {
+			return err
+		}
+		var ids []int
+		for _, notification := range notifications {
+			if notification.RawEvent["type"] == "on_assignment" && !notification.IsSent &&
+				assignedTo != nil && notification.UserID == *assignedTo {
+				continue
+			}
+			if approvers[notification.UserID] && !notification.IsSent && notification.RawEvent["type"] == "on_pending_approval" {
+				continue
+			}
+			ids = append(ids, notification.ID)
+		}
+		if len(ids) == 0 {
+			return nil
+		}
+		return tx.Where("id IN ?", ids).Delete(&nModel.Notification{}).Error
+	})
 }
 
 func (r *NotificationRepository) BatchInsertNotifications(notifications []*nModel.Notification) error {
@@ -38,8 +86,11 @@ func (r *NotificationRepository) GetPendingNotification(c context.Context, lookb
 	end := time.Now().UTC()
 	if err := r.db.Table("notifications").
 		// Reminders of chores in a project hidden from the circle are not mirrored to
-		// the circle-wide webhook.
-		Select("notifications.*, CASE WHEN projects.is_private = true THEN NULL ELSE circles.webhook_url END as webhook_url").
+		// the circle-wide webhook. Digest notifications (chore_id is a negative
+		// sentinel, see service.DigestChoreIDDaily/Weekly -- they aren't about one
+		// real chore) never are either: they're a push-only summary, not an event
+		// about a specific chore a webhook consumer would expect.
+		Select("notifications.*, CASE WHEN notifications.chore_id < 0 THEN NULL WHEN projects.is_private = true THEN NULL ELSE circles.webhook_url END as webhook_url").
 		Joins("left join circles on circles.id = notifications.circle_id").
 		Joins("left join chores on chores.id = notifications.chore_id").
 		Joins("left join projects on projects.id = chores.project_id").
@@ -52,4 +103,19 @@ func (r *NotificationRepository) GetPendingNotification(c context.Context, lookb
 
 func (r *NotificationRepository) DeleteSentNotifications(c context.Context, since time.Time) error {
 	return r.db.WithContext(c).Where("is_sent = ? AND scheduled_for < ?", true, since).Delete(&nModel.Notification{}).Error
+}
+
+// ExistsNotification reports whether a notification with this sentinel choreID
+// (a digest run uses a negative sentinel, see service.DigestChoreIDDaily /
+// DigestChoreIDWeekly, since it isn't about one real chore) was already created
+// for userID since the given time. Used to avoid sending the same digest twice
+// if the digest scheduler job runs more than once inside a user's send hour.
+func (r *NotificationRepository) ExistsNotification(c context.Context, userID int, choreID int, since time.Time) (bool, error) {
+	var count int64
+	if err := r.db.WithContext(c).Model(&nModel.Notification{}).
+		Where("user_id = ? AND chore_id = ? AND created_at >= ?", userID, choreID, since).
+		Count(&count).Error; err != nil {
+		return false, err
+	}
+	return count > 0, nil
 }
